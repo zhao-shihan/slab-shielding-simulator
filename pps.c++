@@ -55,6 +55,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -68,22 +69,34 @@ auto DefaultThreadCount() -> int {
 constexpr auto poissonUpperLimit{2.3};
 constexpr auto ratioTolerance{1e-6};
 
-struct Config {
-    double mThickness{0.0};
+struct Layer {
     std::string mMaterialName;
+    double mThickness{0.0};
+};
+
+struct Config {
+    std::vector<Layer> mLayers;
     double mEnergy{0.0};
     std::string mParticleName;
     std::string mOutputFileName{"pps_output.root"};
     std::string mPhysicsListName{"QGSP_BIC_AllHP_EMZ"};
     int mThreads{DefaultThreadCount()};
     int mVerbose{0};
+    bool mIncludeNeutrinos{false};
     int mEventCount{0};
     int mPrintProgress{1000};
     bool mUI{false};
-    bool mDecay{false};
     bool mOverwrite{false};
     bool mHelp{false};
     std::string mMacroFileName;
+
+    auto TotalThickness() const -> double {
+        auto total{0.0};
+        for (const auto& layer : mLayers) {
+            total += layer.mThickness;
+        }
+        return total;
+    }
 };
 
 auto ParseQuantity(const std::string& text, const std::map<std::string, double>& units) -> double {
@@ -131,6 +144,45 @@ auto ParseEnergy(const std::string& text) -> double {
     return ParseQuantity(text, units);
 }
 
+auto Trim(const std::string& text) -> std::string {
+    const auto first = text.find_first_not_of(" \t");
+    if (first == std::string::npos) {
+        return "";
+    }
+    const auto last = text.find_last_not_of(" \t");
+    return text.substr(first, last - first + 1);
+}
+
+auto ParseLayers(const std::string& text) -> std::vector<Layer> {
+    auto layers = std::vector<Layer>{};
+    auto stream = std::istringstream{text};
+    auto layerSpec = std::string{};
+    while (std::getline(stream, layerSpec, ';')) {
+        if (layerSpec.empty()) {
+            throw std::invalid_argument("empty layer specification in '" + text + "'");
+        }
+        const auto colon = layerSpec.find(':');
+        if (colon == std::string::npos) {
+            throw std::invalid_argument(
+                "layer '" + layerSpec + "' must have the form 'material:thickness', e.g. G4_Cu:10 cm");
+        }
+        auto layer = Layer{};
+        layer.mMaterialName = Trim(layerSpec.substr(0, colon));
+        layer.mThickness = ParseLength(Trim(layerSpec.substr(colon + 1)));
+        if (layer.mMaterialName.empty()) {
+            throw std::invalid_argument("layer '" + layerSpec + "' has an empty material name");
+        }
+        if (layer.mThickness <= 0.0) {
+            throw std::invalid_argument("layer '" + layerSpec + "' has a non-positive thickness");
+        }
+        layers.push_back(std::move(layer));
+    }
+    if (layers.empty()) {
+        throw std::invalid_argument("at least one material layer is required");
+    }
+    return layers;
+}
+
 auto FormatEnergy(double energy) -> std::string {
     auto stream = std::ostringstream{};
     stream << G4BestUnit(energy, "Energy");
@@ -145,8 +197,8 @@ auto PrintUsage(const char* programName) -> void {
         << "RNTuple 'run{runId}' inside a ROOT file\n"
         << "\n"
         << "required options:\n"
-        << "  -t, --thickness <value>  material slab thickness; bare value in mm or with a unit, e.g. \"10 cm\"\n"
-        << "  -m, --material <name>    material slab NIST material name, e.g. G4_WATER, G4_Cu\n"
+        << "  -m, --material <spec>    material layers as semicolon-separated 'name:thickness' entries, built in\n"
+        << "                           order from the source, e.g. \"G4_WATER:10 cm;G4_Cu:5 cm\"\n"
         << "  -e, --energy <value>     primary kinetic energy; bare value in MeV or with a unit, e.g. \"100 MeV\"\n"
         << "  -p, --particle <name>    primary particle name, e.g. proton, neutron, gamma (Geant4 particle table)\n"
         << "\n"
@@ -159,7 +211,8 @@ auto PrintUsage(const char* programName) -> void {
         << "  -l, --physics <name>     reference physics list name (default: QGSP_BIC_AllHP_EMZ)\n"
         << "  -j, --threads <count>    worker thread count; 1 runs sequential, > 1 runs multithreaded (default: all CPU cores)\n"
         << "  -v, --verbose <level>    Geant4 verbosity level; 0 prints only the banner, progress, and summary (default: 0)\n"
-        << "  -d, --decay              enable particle decay; disabled by default\n"
+        << "  -N, --neutrinos          include neutrino kinetic energy in the world boundary energy statistics;\n"
+        << "                           neutrinos are ignored by default\n"
         << "  -f, --force              overwrite the output file if it already exists\n"
         << "  -h, --help               print this message\n"
         << "\n"
@@ -182,10 +235,8 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
         const auto argument{std::string{argv[i]}};
         if (argument == "-h" or argument == "--help") {
             config.mHelp = true;
-        } else if (argument == "-t" or argument == "--thickness") {
-            config.mThickness = ParseLength(nextValue(i, argument));
         } else if (argument == "-m" or argument == "--material") {
-            config.mMaterialName = nextValue(i, argument);
+            config.mLayers = ParseLayers(nextValue(i, argument));
         } else if (argument == "-e" or argument == "--energy") {
             config.mEnergy = ParseEnergy(nextValue(i, argument));
         } else if (argument == "-p" or argument == "--particle") {
@@ -208,8 +259,8 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
             }
         } else if (argument == "-i" or argument == "--ui") {
             config.mUI = true;
-        } else if (argument == "-d" or argument == "--decay") {
-            config.mDecay = true;
+        } else if (argument == "-N" or argument == "--neutrinos") {
+            config.mIncludeNeutrinos = true;
         } else if (argument == "-f" or argument == "--force") {
             config.mOverwrite = true;
         } else if (not argument.empty() and argument.front() == '-') {
@@ -225,10 +276,7 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
         config.mMacroFileName = positional.front();
     }
     if (not config.mHelp) {
-        if (config.mThickness <= 0.0) {
-            throw std::invalid_argument("required option --thickness is missing or not positive");
-        }
-        if (config.mMaterialName.empty()) {
+        if (config.mLayers.empty()) {
             throw std::invalid_argument("required option --material is missing");
         }
         if (config.mEnergy <= 0.0) {
@@ -250,9 +298,11 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
     return config;
 }
 
-auto ValidateMaterial(const Config& config) -> void {
-    if (G4NistManager::Instance()->FindOrBuildMaterial(config.mMaterialName) == nullptr) {
-        throw std::invalid_argument("material '" + config.mMaterialName + "' not found in the NIST material database");
+auto ValidateMaterials(const Config& config) -> void {
+    for (const auto& layer : config.mLayers) {
+        if (G4NistManager::Instance()->FindOrBuildMaterial(layer.mMaterialName) == nullptr) {
+            throw std::invalid_argument("material '" + layer.mMaterialName + "' not found in the NIST material database");
+        }
     }
 }
 
@@ -260,6 +310,11 @@ auto ValidateParticle(const Config& config) -> void {
     if (G4ParticleTable::GetParticleTable()->FindParticle(config.mParticleName) == nullptr) {
         throw std::invalid_argument("particle '" + config.mParticleName + "' not found in the particle table");
     }
+}
+
+auto IsNeutrino(const G4ParticleDefinition* particle) -> bool {
+    const auto pdg = std::abs(particle->GetPDGEncoding());
+    return pdg == 12 or pdg == 14 or pdg == 16;
 }
 
 class OutputWriter {
@@ -290,22 +345,26 @@ public:
         mInitialized = true;
     }
 
-    auto BeginRun(int runId) -> void {
+    auto BeginRun(int runId, int layerCount) -> void {
         try {
             auto model = ROOT::RNTupleModel::CreateBare();
             model->MakeField<int>("event_id");
-            model->MakeField<float>("total_e_dep");
-            model->MakeField<std::vector<std::string>>("particle_dep");
-            model->MakeField<std::vector<float>>("x_dep");
-            model->MakeField<std::vector<float>>("y_dep");
-            model->MakeField<std::vector<float>>("z_dep");
-            model->MakeField<std::vector<float>>("w_dep");
-            model->MakeField<std::vector<std::string>>("proc_dep");
             model->MakeField<float>("total_e_pen");
             model->MakeField<std::vector<std::string>>("particle_pen");
             model->MakeField<std::vector<float>>("theta_pen");
             model->MakeField<std::vector<float>>("phi_pen");
             model->MakeField<std::vector<float>>("e_pen");
+            model->MakeField<float>("total_e_dep");
+            for (auto layerIndex{0}; layerIndex < layerCount; ++layerIndex) {
+                const auto suffix = std::to_string(layerIndex);
+                model->MakeField<float>("e_dep_" + suffix);
+                model->MakeField<std::vector<std::string>>("particle_dep_" + suffix);
+                model->MakeField<std::vector<float>>("x_dep_" + suffix);
+                model->MakeField<std::vector<float>>("y_dep_" + suffix);
+                model->MakeField<std::vector<float>>("z_dep_" + suffix);
+                model->MakeField<std::vector<float>>("w_dep_" + suffix);
+                model->MakeField<std::vector<std::string>>("proc_dep_" + suffix);
+            }
             model->MakeField<float>("total_e_bsc");
             model->MakeField<std::vector<std::string>>("particle_bsc");
             model->MakeField<std::vector<float>>("theta_bsc");
@@ -362,47 +421,62 @@ public:
             new G4Material{"vacuum", 1e-16 * g / cm3, 1, kStateGas, 293.15 * kelvin, atmosphere};
         vacuumMaterial->AddElement(hydrogen, 1);
 
-        const auto xyHalfLength{500.0 * mConfig.mThickness};
-        const auto worldZHalfLength{1.1 * mConfig.mThickness};
+        const auto totalThickness = mConfig.TotalThickness();
+        const auto xyHalfLength{500.0 * totalThickness};
+        const auto worldZHalfLength{1.1 * totalThickness};
 
         const auto solidWorld = new G4Box{"World", xyHalfLength, xyHalfLength, worldZHalfLength};
         const auto logicalWorld = new G4LogicalVolume{solidWorld, vacuumMaterial, "World"};
-        const auto physicalWorld =
-            new G4PVPlacement{nullptr, G4ThreeVector{}, logicalWorld, "World", nullptr, false, 0,
-                              mConfig.mVerbose > 0};
+        const auto physicalWorld = new G4PVPlacement{
+            nullptr, G4ThreeVector{}, logicalWorld, "World", nullptr, false, 0,
+            mConfig.mVerbose > 0};
 
-        const auto materialMaterial = nistManager->FindOrBuildMaterial(mConfig.mMaterialName);
-        const auto solidMaterial =
-            new G4Box{"MaterialSolid", xyHalfLength, xyHalfLength, 0.5 * mConfig.mThickness};
-        const auto logicalMaterial = new G4LogicalVolume{solidMaterial, materialMaterial, "Material"};
-        new G4PVPlacement{
-            nullptr, G4ThreeVector{0.0, 0.0, 0.5 * mConfig.mThickness},
-            logicalMaterial, "Material",
-            logicalWorld, false, 0, mConfig.mVerbose > 0
-        };
+        auto layerIndex{0};
+        auto zPosition{0.0};
+        for (const auto& layer : mConfig.mLayers) {
+            const auto layerHalfLength = 0.5 * layer.mThickness;
+            const auto solidLayer = new G4Box{"LayerSolid", xyHalfLength, xyHalfLength, layerHalfLength};
+            const auto layerMaterial = nistManager->FindOrBuildMaterial(layer.mMaterialName);
+            const auto logicalLayer = new G4LogicalVolume{solidLayer, layerMaterial, "Layer"};
+            new G4PVPlacement{
+                nullptr, G4ThreeVector{0.0, 0.0, zPosition + layerHalfLength},
+                logicalLayer, "Layer",
+                logicalWorld, false, layerIndex, mConfig.mVerbose > 0
+            };
+            mMaterialVolumes.emplace(logicalLayer, layerIndex);
+            zPosition += layer.mThickness;
+            ++layerIndex;
+        }
 
-        mMaterialVolume = logicalMaterial;
         return physicalWorld;
     }
 
-    auto GetMaterialVolume() const -> const G4LogicalVolume* {
-        return mMaterialVolume;
+    auto GetMaterialVolumes() const -> const std::unordered_map<const G4LogicalVolume*, int>& {
+        return mMaterialVolumes;
     }
 
 private:
     const Config& mConfig;
-    const G4LogicalVolume* mMaterialVolume{nullptr};
+    std::unordered_map<const G4LogicalVolume*, int> mMaterialVolumes;
 };
 
 class SimulationRun : public G4Run {
 public:
+    explicit SimulationRun(int layerCount) :
+        mLayerDepEnergySums(layerCount, 0.0),
+        mLayerDepEnergySumsSq(layerCount, 0.0) {}
+
     auto Merge(const G4Run* other) -> void override {
         G4Run::Merge(other);
         const auto* otherSimulationRun = static_cast<const SimulationRun*>(other);
-        mDepEnergySum += otherSimulationRun->mDepEnergySum;
-        mDepEnergySumSq += otherSimulationRun->mDepEnergySumSq;
         mPenEnergySum += otherSimulationRun->mPenEnergySum;
         mPenEnergySumSq += otherSimulationRun->mPenEnergySumSq;
+        mDepEnergySum += otherSimulationRun->mDepEnergySum;
+        mDepEnergySumSq += otherSimulationRun->mDepEnergySumSq;
+        for (auto layerIndex{0}; layerIndex < static_cast<int>(mLayerDepEnergySums.size()); ++layerIndex) {
+            mLayerDepEnergySums[layerIndex] += otherSimulationRun->mLayerDepEnergySums[layerIndex];
+            mLayerDepEnergySumsSq[layerIndex] += otherSimulationRun->mLayerDepEnergySumsSq[layerIndex];
+        }
         mBscEnergySum += otherSimulationRun->mBscEnergySum;
         mBscEnergySumSq += otherSimulationRun->mBscEnergySumSq;
         AddToMap(mPenParticleCount, otherSimulationRun->mPenParticleCount);
@@ -413,11 +487,19 @@ public:
         AddToMap(mBscParticleEnergySumSq, otherSimulationRun->mBscParticleEnergySumSq);
     }
 
-    auto AddEventResult(double depositionEnergy, double penetrationEnergy, double backscatteringEnergy) -> void {
-        mDepEnergySum += depositionEnergy;
-        mDepEnergySumSq += depositionEnergy * depositionEnergy;
+    auto AddEventResult(double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
+                        double backscatteringEnergy) -> void {
         mPenEnergySum += penetrationEnergy;
         mPenEnergySumSq += penetrationEnergy * penetrationEnergy;
+        auto totalDepositionEnergy{0.0};
+        for (auto layerIndex{0}; layerIndex < static_cast<int>(layerDepositionEnergies.size()); ++layerIndex) {
+            const auto layerDepositionEnergy = layerDepositionEnergies[layerIndex];
+            mLayerDepEnergySums[layerIndex] += layerDepositionEnergy;
+            mLayerDepEnergySumsSq[layerIndex] += layerDepositionEnergy * layerDepositionEnergy;
+            totalDepositionEnergy += layerDepositionEnergy;
+        }
+        mDepEnergySum += totalDepositionEnergy;
+        mDepEnergySumSq += totalDepositionEnergy * totalDepositionEnergy;
         mBscEnergySum += backscatteringEnergy;
         mBscEnergySumSq += backscatteringEnergy * backscatteringEnergy;
     }
@@ -434,10 +516,13 @@ public:
         mBscParticleEnergySumSq[particleName] += energy * energy;
     }
 
-    auto GetDepEnergySum() const -> double { return mDepEnergySum; }
-    auto GetDepEnergySumSq() const -> double { return mDepEnergySumSq; }
     auto GetPenEnergySum() const -> double { return mPenEnergySum; }
     auto GetPenEnergySumSq() const -> double { return mPenEnergySumSq; }
+    auto GetDepEnergySum() const -> double { return mDepEnergySum; }
+    auto GetDepEnergySumSq() const -> double { return mDepEnergySumSq; }
+    auto GetLayerDepEnergySum(int layerIndex) const -> double { return mLayerDepEnergySums[layerIndex]; }
+    auto GetLayerDepEnergySumSq(int layerIndex) const -> double { return mLayerDepEnergySumsSq[layerIndex]; }
+    auto GetLayerCount() const -> int { return static_cast<int>(mLayerDepEnergySums.size()); }
     auto GetBscEnergySum() const -> double { return mBscEnergySum; }
     auto GetBscEnergySumSq() const -> double { return mBscEnergySumSq; }
     auto GetPenParticleCounts() const -> const std::map<std::string, double>& { return mPenParticleCount; }
@@ -454,10 +539,12 @@ private:
         }
     }
 
-    double mDepEnergySum{0.0};
-    double mDepEnergySumSq{0.0};
     double mPenEnergySum{0.0};
     double mPenEnergySumSq{0.0};
+    double mDepEnergySum{0.0};
+    double mDepEnergySumSq{0.0};
+    std::vector<double> mLayerDepEnergySums;
+    std::vector<double> mLayerDepEnergySumsSq;
     double mBscEnergySum{0.0};
     double mBscEnergySumSq{0.0};
     std::map<std::string, double> mPenParticleCount;
@@ -475,13 +562,13 @@ public:
     ~RunAction() override = default;
 
     auto GenerateRun() -> G4Run* override {
-        return new SimulationRun{};
+        return new SimulationRun{static_cast<int>(mConfig.mLayers.size())};
     }
 
     auto BeginOfRunAction(const G4Run* run) -> void override {
         mCurrentRun = const_cast<SimulationRun*>(static_cast<const SimulationRun*>(run));
         if (IsMaster()) {
-            OutputWriter::Instance().BeginRun(run->GetRunID());
+            OutputWriter::Instance().BeginRun(run->GetRunID(), static_cast<int>(mConfig.mLayers.size()));
         }
         if (not IsMaster() or not G4Threading::IsMultithreadedApplication()) {
             mFillContext = OutputWriter::Instance().CreateFillContext();
@@ -498,8 +585,9 @@ public:
         }
     }
 
-    auto AddEventResult(double depositionEnergy, double penetrationEnergy, double backscatteringEnergy) -> void {
-        mCurrentRun->AddEventResult(depositionEnergy, penetrationEnergy, backscatteringEnergy);
+    auto AddEventResult(double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
+                        double backscatteringEnergy) -> void {
+        mCurrentRun->AddEventResult(penetrationEnergy, layerDepositionEnergies, backscatteringEnergy);
     }
 
     auto AddPenetrationEnergy(const std::string& particleName, double energy) -> void {
@@ -531,6 +619,10 @@ private:
                << ", " << eventCount << " events):\n";
         PrintEnergyRatio("penetration ratio (pen)", run.GetPenEnergySum(), run.GetPenEnergySumSq(), eventCount);
         PrintEnergyRatio("deposition ratio (dep)", run.GetDepEnergySum(), run.GetDepEnergySumSq(), eventCount);
+        for (auto layerIndex{0}; layerIndex < run.GetLayerCount(); ++layerIndex) {
+            const auto label = "  in layer " + std::to_string(layerIndex) + " (" + mConfig.mLayers[layerIndex].mMaterialName + ')';
+            PrintEnergyRatio(label, run.GetLayerDepEnergySum(layerIndex), run.GetLayerDepEnergySumSq(layerIndex), eventCount);
+        }
         PrintEnergyRatio("back-scattering ratio (bsc)", run.GetBscEnergySum(), run.GetBscEnergySumSq(), eventCount);
         G4cout << "-------------------------------------------------------------------------------\n";
         PrintParticleStatistics("penetration particles", run.GetPenParticleCounts(), run.GetPenParticleEnergySums(), run.GetPenParticleEnergySumsSq());
@@ -570,7 +662,7 @@ private:
         const auto ratio = meanEnergy / mConfig.mEnergy;
         const auto variance = (sumEnergySq - sumEnergy * sumEnergy / eventCount) / (eventCount - 1);
         const auto ratioError = std::sqrt(variance / eventCount) / mConfig.mEnergy;
-        G4cout << "   " << std::left << std::setw(30) << label << '(' << 100.0 * ratio << " +/- "
+        G4cout << "   " << std::left << std::setw(45) << label << '(' << 100.0 * ratio << " +/- "
                << 100.0 * ratioError << ") %" << G4endl;
     }
 
@@ -582,8 +674,16 @@ private:
 
 class EventAction : public G4UserEventAction {
 public:
-    explicit EventAction(RunAction* runAction) :
-        mRunAction{runAction} {}
+    explicit EventAction(RunAction* runAction, int layerCount) :
+        mRunAction{runAction},
+        mLayerCount{layerCount},
+        mLayerEdep(layerCount, 0.0F),
+        mParticleDep(layerCount),
+        mXDep(layerCount),
+        mYDep(layerCount),
+        mZDep(layerCount),
+        mWDep(layerCount),
+        mProcDep(layerCount) {}
     ~EventAction() override = default;
 
     auto BeginOfEventAction(const G4Event*) -> void override {
@@ -593,37 +693,63 @@ public:
             mFillContext = mRunAction->GetFillContext().get();
             mEntry = mFillContext->CreateEntry();
             mEventIdField = mEntry->GetPtr<int>("event_id");
-            mTotalEdepField = mEntry->GetPtr<float>("total_e_dep");
-            mParticleDepField = mEntry->GetPtr<std::vector<std::string>>("particle_dep");
-            mXDepField = mEntry->GetPtr<std::vector<float>>("x_dep");
-            mYDepField = mEntry->GetPtr<std::vector<float>>("y_dep");
-            mZDepField = mEntry->GetPtr<std::vector<float>>("z_dep");
-            mWDepField = mEntry->GetPtr<std::vector<float>>("w_dep");
-            mProcDepField = mEntry->GetPtr<std::vector<std::string>>("proc_dep");
             mTotalEPenField = mEntry->GetPtr<float>("total_e_pen");
             mParticlePenField = mEntry->GetPtr<std::vector<std::string>>("particle_pen");
             mThetaPenField = mEntry->GetPtr<std::vector<float>>("theta_pen");
             mPhiPenField = mEntry->GetPtr<std::vector<float>>("phi_pen");
             mEPenField = mEntry->GetPtr<std::vector<float>>("e_pen");
+            mTotalEdepField = mEntry->GetPtr<float>("total_e_dep");
+            mLayerEdepFields.clear();
+            mParticleDepFields.clear();
+            mXDepFields.clear();
+            mYDepFields.clear();
+            mZDepFields.clear();
+            mWDepFields.clear();
+            mProcDepFields.clear();
+            for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
+                const auto suffix = std::to_string(layerIndex);
+                mLayerEdepFields.push_back(mEntry->GetPtr<float>("e_dep_" + suffix));
+                mParticleDepFields.push_back(mEntry->GetPtr<std::vector<std::string>>("particle_dep_" + suffix));
+                mXDepFields.push_back(mEntry->GetPtr<std::vector<float>>("x_dep_" + suffix));
+                mYDepFields.push_back(mEntry->GetPtr<std::vector<float>>("y_dep_" + suffix));
+                mZDepFields.push_back(mEntry->GetPtr<std::vector<float>>("z_dep_" + suffix));
+                mWDepFields.push_back(mEntry->GetPtr<std::vector<float>>("w_dep_" + suffix));
+                mProcDepFields.push_back(mEntry->GetPtr<std::vector<std::string>>("proc_dep_" + suffix));
+            }
             mTotalEBscField = mEntry->GetPtr<float>("total_e_bsc");
             mParticleBscField = mEntry->GetPtr<std::vector<std::string>>("particle_bsc");
             mThetaBscField = mEntry->GetPtr<std::vector<float>>("theta_bsc");
             mPhiBscField = mEntry->GetPtr<std::vector<float>>("phi_bsc");
             mEBscField = mEntry->GetPtr<std::vector<float>>("e_bsc");
         }
-        mTotalEdep = 0.0F;
         mTotalEPen = 0.0F;
-        mTotalEBsc = 0.0F;
-        mParticleDep.clear();
-        mXDep.clear();
-        mYDep.clear();
-        mZDep.clear();
-        mWDep.clear();
-        mProcDep.clear();
         mParticlePen.clear();
         mThetaPen.clear();
         mPhiPen.clear();
         mEPen.clear();
+        mTotalEdep = 0.0F;
+        for (auto& layerEdep : mLayerEdep) {
+            layerEdep = 0.0F;
+        }
+        for (auto& particleDep : mParticleDep) {
+            particleDep.clear();
+        }
+        for (auto& xDep : mXDep) {
+            xDep.clear();
+        }
+        for (auto& yDep : mYDep) {
+            yDep.clear();
+        }
+        for (auto& zDep : mZDep) {
+            zDep.clear();
+        }
+        for (auto& wDep : mWDep) {
+            wDep.clear();
+        }
+        for (auto& procDep : mProcDep) {
+            procDep.clear();
+        }
+        mTotalEBsc = 0.0F;
         mParticleBsc.clear();
         mThetaBsc.clear();
         mPhiBsc.clear();
@@ -632,41 +758,45 @@ public:
 
     auto EndOfEventAction(const G4Event* event) -> void override {
         *mEventIdField = event->GetEventID();
-        *mTotalEdepField = mTotalEdep;
-        *mParticleDepField = mParticleDep;
-        *mXDepField = mXDep;
-        *mYDepField = mYDep;
-        *mZDepField = mZDep;
-        *mWDepField = mWDep;
-        *mProcDepField = mProcDep;
         *mTotalEPenField = mTotalEPen;
         *mParticlePenField = mParticlePen;
         *mThetaPenField = mThetaPen;
         *mPhiPenField = mPhiPen;
         *mEPenField = mEPen;
+        *mTotalEdepField = mTotalEdep;
+        for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
+            *mLayerEdepFields[layerIndex] = mLayerEdep[layerIndex];
+            *mParticleDepFields[layerIndex] = mParticleDep[layerIndex];
+            *mXDepFields[layerIndex] = mXDep[layerIndex];
+            *mYDepFields[layerIndex] = mYDep[layerIndex];
+            *mZDepFields[layerIndex] = mZDep[layerIndex];
+            *mWDepFields[layerIndex] = mWDep[layerIndex];
+            *mProcDepFields[layerIndex] = mProcDep[layerIndex];
+        }
         *mTotalEBscField = mTotalEBsc;
         *mParticleBscField = mParticleBsc;
         *mThetaBscField = mThetaBsc;
         *mPhiBscField = mPhiBsc;
         *mEBscField = mEBsc;
         mFillContext->Fill(*mEntry);
-        mRunAction->AddEventResult(mTotalEdep, mTotalEPen, mTotalEBsc);
-    }
-
-    auto AddDeposition(const std::string& particleName, const G4ThreeVector& position, float edep,
-                       const std::string& processName) -> void {
-        mTotalEdep += edep;
-        mParticleDep.push_back(particleName);
-        mXDep.push_back(static_cast<float>(position.x()));
-        mYDep.push_back(static_cast<float>(position.y()));
-        mZDep.push_back(static_cast<float>(position.z()));
-        mWDep.push_back(edep);
-        mProcDep.push_back(processName);
+        mRunAction->AddEventResult(mTotalEPen, mLayerEdep, mTotalEBsc);
     }
 
     auto AddPenetration(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
         AddExitPoint(mParticlePen, mThetaPen, mPhiPen, mEPen, mTotalEPen, particleName, direction, energy);
         mRunAction->AddPenetrationEnergy(particleName, energy);
+    }
+
+    auto AddDeposition(int layerIndex, const std::string& particleName, const G4ThreeVector& position, float edep,
+                       const std::string& processName) -> void {
+        mTotalEdep += edep;
+        mLayerEdep[layerIndex] += edep;
+        mParticleDep[layerIndex].push_back(particleName);
+        mXDep[layerIndex].push_back(static_cast<float>(position.x()));
+        mYDep[layerIndex].push_back(static_cast<float>(position.y()));
+        mZDep[layerIndex].push_back(static_cast<float>(position.z()));
+        mWDep[layerIndex].push_back(edep);
+        mProcDep[layerIndex].push_back(processName);
     }
 
     auto AddBackscattering(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
@@ -687,40 +817,43 @@ private:
     }
 
     RunAction* mRunAction;
+    int mLayerCount{0};
     ROOT::RNTupleFillContext* mFillContext{nullptr};
     std::unique_ptr<ROOT::REntry> mEntry;
     int mRunId{-1};
     std::shared_ptr<int> mEventIdField;
-    std::shared_ptr<float> mTotalEdepField;
-    std::shared_ptr<std::vector<std::string>> mParticleDepField;
-    std::shared_ptr<std::vector<float>> mXDepField;
-    std::shared_ptr<std::vector<float>> mYDepField;
-    std::shared_ptr<std::vector<float>> mZDepField;
-    std::shared_ptr<std::vector<float>> mWDepField;
-    std::shared_ptr<std::vector<std::string>> mProcDepField;
     std::shared_ptr<float> mTotalEPenField;
     std::shared_ptr<std::vector<std::string>> mParticlePenField;
     std::shared_ptr<std::vector<float>> mThetaPenField;
     std::shared_ptr<std::vector<float>> mPhiPenField;
     std::shared_ptr<std::vector<float>> mEPenField;
+    std::shared_ptr<float> mTotalEdepField;
+    std::vector<std::shared_ptr<float>> mLayerEdepFields;
+    std::vector<std::shared_ptr<std::vector<std::string>>> mParticleDepFields;
+    std::vector<std::shared_ptr<std::vector<float>>> mXDepFields;
+    std::vector<std::shared_ptr<std::vector<float>>> mYDepFields;
+    std::vector<std::shared_ptr<std::vector<float>>> mZDepFields;
+    std::vector<std::shared_ptr<std::vector<float>>> mWDepFields;
+    std::vector<std::shared_ptr<std::vector<std::string>>> mProcDepFields;
     std::shared_ptr<float> mTotalEBscField;
     std::shared_ptr<std::vector<std::string>> mParticleBscField;
     std::shared_ptr<std::vector<float>> mThetaBscField;
     std::shared_ptr<std::vector<float>> mPhiBscField;
     std::shared_ptr<std::vector<float>> mEBscField;
-    float mTotalEdep{0.0F};
     float mTotalEPen{0.0F};
-    float mTotalEBsc{0.0F};
-    std::vector<std::string> mParticleDep;
-    std::vector<float> mXDep;
-    std::vector<float> mYDep;
-    std::vector<float> mZDep;
-    std::vector<float> mWDep;
-    std::vector<std::string> mProcDep;
     std::vector<std::string> mParticlePen;
     std::vector<float> mThetaPen;
     std::vector<float> mPhiPen;
     std::vector<float> mEPen;
+    float mTotalEdep{0.0F};
+    std::vector<float> mLayerEdep;
+    std::vector<std::vector<std::string>> mParticleDep;
+    std::vector<std::vector<float>> mXDep;
+    std::vector<std::vector<float>> mYDep;
+    std::vector<std::vector<float>> mZDep;
+    std::vector<std::vector<float>> mWDep;
+    std::vector<std::vector<std::string>> mProcDep;
+    float mTotalEBsc{0.0F};
     std::vector<std::string> mParticleBsc;
     std::vector<float> mThetaBsc;
     std::vector<float> mPhiBsc;
@@ -734,52 +867,51 @@ public:
     ~SteppingAction() override = default;
 
     auto UserSteppingAction(const G4Step* step) -> void override {
-        if (mMaterialVolume == nullptr) {
+        if (mMaterialVolumes.empty()) {
             const auto detectorConstruction = static_cast<const DetectorConstruction*>(
                 G4RunManager::GetRunManager()->GetUserDetectorConstruction());
-            mMaterialVolume = detectorConstruction->GetMaterialVolume();
+            mMaterialVolumes = detectorConstruction->GetMaterialVolumes();
         }
-        const auto preStepPoint = step->GetPreStepPoint();
-        const auto touchableHandle = preStepPoint->GetTouchableHandle();
-        if (touchableHandle() == nullptr) {
+        const auto logicalVolume = step->GetPreStepPoint()->GetTouchableHandle()->GetVolume()->GetLogicalVolume();
+        const auto layerIt = mMaterialVolumes.find(logicalVolume);
+        if (layerIt == mMaterialVolumes.end()) {
             return;
         }
-        const auto volume = touchableHandle->GetVolume();
-        if (volume == nullptr or volume->GetLogicalVolume() != mMaterialVolume) {
-            return;
-        }
+        const auto layerIndex = layerIt->second;
         const auto edep = step->GetTotalEnergyDeposit();
         if (edep <= 0.0) {
             return;
         }
         const auto process = step->GetPostStepPoint()->GetProcessDefinedStep();
-        const auto processName = process != nullptr ? process->GetProcessName() : G4String{};
-        mEventAction->AddDeposition(step->GetTrack()->GetDefinition()->GetParticleName(),
+        const auto processName = process != nullptr ? process->GetProcessName() : "<null>";
+        mEventAction->AddDeposition(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
                                     step->GetPostStepPoint()->GetPosition(), static_cast<float>(edep), processName);
     }
 
 private:
     EventAction* mEventAction;
-    const G4LogicalVolume* mMaterialVolume{nullptr};
+    std::unordered_map<const G4LogicalVolume*, int> mMaterialVolumes;
 };
 
 class TrackingAction : public G4UserTrackingAction {
 public:
-    explicit TrackingAction(EventAction* eventAction) :
-        mEventAction{eventAction} {}
+    explicit TrackingAction(EventAction* eventAction, bool includeNeutrinos) :
+        mEventAction{eventAction},
+        mIncludeNeutrinos{includeNeutrinos} {}
     ~TrackingAction() override = default;
 
     auto PostUserTrackingAction(const G4Track* track) -> void override {
         const auto step = track->GetStep();
-        if (step == nullptr) {
+        if (step->GetPostStepPoint()->GetStepStatus() != fWorldBoundary) {
             return;
         }
-        if (step->GetPostStepPoint()->GetStepStatus() != fWorldBoundary) {
+        const auto definition = track->GetDefinition();
+        if (not mIncludeNeutrinos and IsNeutrino(definition)) {
             return;
         }
         const auto direction = track->GetMomentumDirection();
         const auto energy = static_cast<float>(track->GetKineticEnergy());
-        const auto particleName = track->GetDefinition()->GetParticleName();
+        const auto particleName = definition->GetParticleName();
         if (direction.z() >= 0.0) {
             mEventAction->AddPenetration(particleName, direction, energy);
         } else {
@@ -789,6 +921,7 @@ public:
 
 private:
     EventAction* mEventAction;
+    bool mIncludeNeutrinos{false};
 };
 
 class PrimaryGeneratorAction : public G4VUserPrimaryGeneratorAction {
@@ -830,11 +963,11 @@ public:
     auto Build() const -> void override {
         const auto runAction = new RunAction{mConfig};
         SetUserAction(runAction);
-        const auto eventAction = new EventAction{runAction};
+        const auto eventAction = new EventAction{runAction, static_cast<int>(mConfig.mLayers.size())};
         SetUserAction(eventAction);
         SetUserAction(new PrimaryGeneratorAction{mConfig});
         SetUserAction(new SteppingAction{eventAction});
-        SetUserAction(new TrackingAction{eventAction});
+        SetUserAction(new TrackingAction{eventAction, mConfig.mIncludeNeutrinos});
     }
 
 private:
@@ -862,7 +995,7 @@ auto main(int argc, char** argv) -> int try {
         return EXIT_SUCCESS;
     }
 
-    PPS::ValidateMaterial(config);
+    PPS::ValidateMaterials(config);
 
     const auto runManager =
         std::unique_ptr<G4RunManager>{G4RunManagerFactory::CreateRunManager(
@@ -901,12 +1034,6 @@ auto main(int argc, char** argv) -> int try {
     const auto printProgress =
         config.mEventCount > 0 ? std::max(1, config.mEventCount / 10) : config.mPrintProgress;
     uiManager->ApplyCommand("/run/printProgress " + std::to_string(printProgress));
-    if (not config.mDecay) {
-        const auto applyResult = uiManager->ApplyCommand("/process/inactivate Decay");
-        if (applyResult != 0) {
-            G4cerr << "warning: failed to inactivate the decay process" << G4endl;
-        }
-    }
     if (config.mUI) {
         std::unique_ptr<G4UIExecutive> ui(new G4UIExecutive{argc, argv});
         for (const auto& command : PPS::defaultVisCommands) {
