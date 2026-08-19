@@ -63,7 +63,7 @@
 #include <utility>
 #include <vector>
 
-namespace PPS {
+namespace SSS {
 
 auto DefaultThreadCount() -> int {
     const auto coreCount = std::thread::hardware_concurrency();
@@ -110,7 +110,7 @@ struct RadiationSource {
 struct Config {
     std::vector<Layer> mLayers;
     std::vector<RadiationSource> mSources;
-    std::string mOutputFileName{"pps_output.root"};
+    std::string mOutputFileName{"sss_output.root"};
     std::string mPhysicsListName{"QGSP_BIC_AllHP_EMZ"};
     int mThreads{DefaultThreadCount()};
     int mVerbose{0};
@@ -444,7 +444,7 @@ auto PrintUsage(const char* programName) -> void {
         << "  -i, --ui                 start an interactive UI session with visualization; if set, visualization\n"
         << "                           is enabled, otherwise the program runs without any UI\n"
         << "  -o, --output [<file>]    save per-event simulation results into a ROOT file, one RNTuple per\n"
-        << "                           source category; the file name may be omitted (default: pps_output.root)\n"
+        << "                           source category; the file name may be omitted (default: sss_output.root)\n"
         << "                           or given as a value, e.g. --output out.root; without this option no\n"
         << "                           ROOT file is produced (never overwrites unless --force)\n"
         << "  -l, --physics <name>     reference physics list name (default: QGSP_BIC_AllHP_EMZ)\n"
@@ -1624,23 +1624,23 @@ constexpr std::array defaultVisCommands = {
     "/vis/viewer/set/viewpointThetaPhi 90 0",
 };
 
-} // namespace PPS
+} // namespace SSS
 
 auto main(int argc, char** argv) -> int try {
-    const auto config{PPS::ParseCommandLine(argc, argv)};
+    const auto config{SSS::ParseCommandLine(argc, argv)};
     if (config.mHelp) {
-        PPS::PrintUsage(argv[0]);
+        SSS::PrintUsage(argv[0]);
         return EXIT_SUCCESS;
     }
 
-    PPS::ValidateMaterials(config);
+    SSS::ValidateMaterials(config);
 
     const auto runManager =
         std::unique_ptr<G4RunManager>{G4RunManagerFactory::CreateRunManager(
             config.mThreads > 1 ? G4RunManagerType::MT : G4RunManagerType::Serial, config.mThreads)};
     runManager->SetVerboseLevel(config.mVerbose);
 
-    runManager->SetUserInitialization(new PPS::DetectorConstruction{config});
+    runManager->SetUserInitialization(new SSS::DetectorConstruction{config});
 
     G4PhysListFactory physicsListFactory(config.mVerbose);
     if (not physicsListFactory.IsReferencePhysList(config.mPhysicsListName)) {
@@ -1660,12 +1660,12 @@ auto main(int argc, char** argv) -> int try {
     G4NuclearLevelData::GetInstance()->GetParameters()->SetVerbose(config.mVerbose);
     runManager->SetUserInitialization(physicsList);
 
-    PPS::ValidateSources(config);
+    SSS::ValidateSources(config);
 
     if (config.mSave) {
-        PPS::OutputWriter::Instance().Initialize(config.mOutputFileName, config.mOverwrite);
+        SSS::OutputWriter::Instance().Initialize(config.mOutputFileName, config.mOverwrite);
     }
-    runManager->SetUserInitialization(new PPS::ActionInitialization{config});
+    runManager->SetUserInitialization(new SSS::ActionInitialization{config});
     const auto visManager = std::unique_ptr<G4VisExecutive>{new G4VisExecutive{"quiet"}};
     visManager->Initialize();
     runManager->Initialize();
@@ -1678,7 +1678,7 @@ auto main(int argc, char** argv) -> int try {
         std::unique_ptr<G4UIExecutive> uiExecutive{
             new G4UIExecutive{argc, argv}
         };
-        for (const auto& command : PPS::defaultVisCommands) {
+        for (const auto& command : SSS::defaultVisCommands) {
             uiManager->ApplyCommand(command);
         }
         if (config.mEventCount > 0) {
@@ -1691,12 +1691,12 @@ auto main(int argc, char** argv) -> int try {
         uiManager->ApplyCommand("/run/beamOn " + std::to_string(config.mEventCount));
     }
     if (config.mSave) {
-        PPS::OutputWriter::Instance().Finalize();
+        SSS::OutputWriter::Instance().Finalize();
     }
 
     return EXIT_SUCCESS;
 } catch (const std::exception& error) {
     G4cerr << "error: " << error.what() << G4endl;
-    PPS::OutputWriter::Instance().Finalize();
+    SSS::OutputWriter::Instance().Finalize();
     std::quick_exit(EXIT_FAILURE);
 }
