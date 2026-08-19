@@ -1069,6 +1069,14 @@ private:
                << G4endl;
     }
 
+    auto FormatLayerLabel(int layerIndex) const -> std::string {
+        auto label = std::ostringstream{};
+        label << "  in layer " << layerIndex << " ("
+              << mConfig.mLayers[layerIndex].mMaterial.mName << ' '
+              << Trim(G4BestUnit(mConfig.mLayers[layerIndex].mThickness, "Length")) << ')';
+        return label.str();
+    }
+
     auto PrintSourceBlock(const std::string& header, const SimulationRun::SourceStatistics& statistics,
                           double incidentEnergy) -> void {
         G4cout << ' ' << header << ":\n";
@@ -1078,8 +1086,7 @@ private:
         PrintEnergyRatio("energy deposition ratio", statistics.mDepositedEnergySum,
                          statistics.mDepositedEnergySumSq, statistics.mEventCount, incidentEnergy);
         for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
-            const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
-                               mConfig.mLayers[layerIndex].mMaterial.mName + ')';
+            const auto label = FormatLayerLabel(layerIndex);
             PrintEnergyRatio(label, statistics.mLayerDepositedEnergySums[layerIndex],
                              statistics.mLayerDepositedEnergySumsSq[layerIndex], statistics.mEventCount,
                              incidentEnergy);
@@ -1094,8 +1101,7 @@ private:
                           statistics.mEventCount);
         PrintPrimaryRatio("primary particle deposition ratio", totalDepositedPrimaryCount, statistics.mEventCount);
         for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
-            const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
-                               mConfig.mLayers[layerIndex].mMaterial.mName + ')';
+            const auto label = FormatLayerLabel(layerIndex);
             PrintPrimaryRatio(label, statistics.mLayerDepositedPrimaryCounts[layerIndex], statistics.mEventCount);
         }
         PrintPrimaryRatio("primary particle backscattering ratio", statistics.mBackscatteredPrimaryCount,
@@ -1124,13 +1130,26 @@ private:
         if (particleCounts.empty()) {
             return;
         }
+        // Sort by descending count; ties keep alphabetical order.
+        auto sortedEntries = std::vector<std::pair<std::string, double>>{};
+        sortedEntries.reserve(particleCounts.size());
+        for (const auto& [particleName, count] : particleCounts) {
+            sortedEntries.emplace_back(particleName, count);
+        }
+        std::sort(sortedEntries.begin(), sortedEntries.end(),
+                  [](const auto& left, const auto& right) {
+                      if (left.second != right.second) {
+                          return left.second > right.second;
+                      }
+                      return left.first < right.first;
+                  });
         G4cout << "   " << title << ":\n";
         G4cout << "     "
                << std::setw(14) << "particle"
                << std::setw(20) << "<E>"
                << std::setw(20) << "rms"
                << std::setw(8) << "n" << '\n';
-        for (const auto& [particleName, count] : particleCounts) {
+        for (const auto& [particleName, count] : sortedEntries) {
             const auto energySum = energySums.find(particleName)->second;
             const auto energySumSq = energySumsSq.find(particleName)->second;
             const auto meanEnergy = energySum / count;
@@ -1678,7 +1697,6 @@ auto main(int argc, char** argv) -> int try {
     return EXIT_SUCCESS;
 } catch (const std::exception& error) {
     G4cerr << "error: " << error.what() << G4endl;
-    // Safe even when saving was disabled (no-op unless a ROOT file is open).
     PPS::OutputWriter::Instance().Finalize();
     std::quick_exit(EXIT_FAILURE);
 }
