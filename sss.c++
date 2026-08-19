@@ -111,7 +111,7 @@ struct Config {
     std::vector<Layer> mLayers;
     std::vector<RadiationSource> mSources;
     std::string mOutputFileName{"sss_output.root"};
-    std::string mPhysicsListName{"QGSP_BIC_AllHP_EMZ"};
+    std::string mPhysicsListName{"QBBC"};
     int mThreads{DefaultThreadCount()};
     int mVerbose{0};
     bool mIncludeNeutrinos{false};
@@ -441,17 +441,17 @@ auto PrintUsage(const char* programName) -> void {
         << "optional options:\n"
         << "  -n, --n-event <count>    simulate <count> events in batch mode; may be combined with --ui to\n"
         << "                           pre-run events before the interactive session opens\n"
+        << "  -l, --phys-list <name>   reference physics list name (default: QBBC)\n"
+        << "  -N, --neutrinos          include neutrino kinetic energy in the world boundary energy statistics;\n"
+        << "                           neutrinos are ignored by default\n"
+        << "  -j, --threads <count>    worker thread count; 1 runs sequential, > 1 runs multithreaded (default: all CPU cores)\n"
+        << "  -v, --verbose <level>    Geant4 verbosity level; 0 prints only the banner, progress, and summary (default: 0)\n"
         << "  -i, --ui                 start an interactive UI session with visualization; if set, visualization\n"
         << "                           is enabled, otherwise the program runs without any UI\n"
         << "  -o, --output [<file>]    save per-event simulation results into a ROOT file, one RNTuple per\n"
         << "                           source category; the file name may be omitted (default: sss_output.root)\n"
         << "                           or given as a value, e.g. --output out.root; without this option no\n"
         << "                           ROOT file is produced (never overwrites unless --force)\n"
-        << "  -l, --physics <name>     reference physics list name (default: QGSP_BIC_AllHP_EMZ)\n"
-        << "  -j, --threads <count>    worker thread count; 1 runs sequential, > 1 runs multithreaded (default: all CPU cores)\n"
-        << "  -v, --verbose <level>    Geant4 verbosity level; 0 prints only the banner, progress, and summary (default: 0)\n"
-        << "  -N, --neutrinos          include neutrino kinetic energy in the world boundary energy statistics;\n"
-        << "                           neutrinos are ignored by default\n"
         << "  -f, --force              overwrite the output file if it already exists\n"
         << "  -h, --help               print this message\n"
         << "\n"
@@ -482,7 +482,7 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
             if (i + 1 < argc and argv[i + 1][0] != '-') {
                 config.mOutputFileName = nextValue(i, argument);
             }
-        } else if (argument == "-l" or argument == "--physics") {
+        } else if (argument == "-l" or argument == "--phys-list") {
             config.mPhysicsListName = nextValue(i, argument);
         } else if (argument == "-j" or argument == "--threads") {
             config.mThreads = std::stoi(nextValue(i, argument));
