@@ -92,6 +92,7 @@ struct Config {
     int mEventCount{0};
     int mPrintProgress{1000};
     bool mUI{false};
+    bool mSave{false};
     bool mOverwrite{false};
     bool mHelp{false};
     std::string mMacroFileName;
@@ -273,14 +274,13 @@ auto PrintUsage(const char* programName) -> void {
         << "usage: " << programName << " [options] [macroFile]\n"
         << "simulate one primary particle per event from a compound radiation source passing through a material\n"
         << "slab, recording per-event energy depositions inside the slab and particles penetrating or backscattering\n"
-        << "into the world boundary; each source category is stored into its own RNTuple 'run{runId}_src{typeId}'\n"
-        << "inside a ROOT file\n"
+        << "into the world boundary; with --output each source category is stored into its own RNTuple\n"
+        << "'run{runId}_src{typeId}' inside a ROOT file, otherwise no ROOT file is produced\n"
         << "\n"
         << "required options:\n"
         << "  -m, --material <spec>    material layers as semicolon-separated 'name:thickness' entries, built in\n"
         << "                           order from the source, e.g. \"G4_WATER:10 cm;G4_Cu:5 cm\"\n"
-        << "  -s, --radiation-src <spec>\n"
-        << "                           compound radiation source as semicolon-separated 'particle:energy[:intensity]'\n"
+        << "  -s, --rad-src <spec>     compound radiation source as semicolon-separated 'particle:energy[:intensity]'\n"
         << "                           entries; the intensity is the relative intensity of the source and may be\n"
         << "                           omitted only when the list contains a single source, e.g.\n"
         << "                           \"e+:10 MeV:15;gamma:3 MeV:12\" or \"neutron:1 MeV\"; intensities are\n"
@@ -292,7 +292,10 @@ auto PrintUsage(const char* programName) -> void {
         << "                           pre-run events before the interactive session opens\n"
         << "  -i, --ui                 start an interactive UI session with visualization; if set, visualization\n"
         << "                           is enabled, otherwise the program runs without any UI\n"
-        << "  -o, --output <file>      output ROOT file name (default: pps_output.root; never overwrites unless --force)\n"
+        << "  -o, --output [<file>]    save per-event simulation results into a ROOT file, one RNTuple per\n"
+        << "                           source category; the file name may be omitted (default: pps_output.root)\n"
+        << "                           or given as a value, e.g. --output out.root; without this option no\n"
+        << "                           ROOT file is produced (never overwrites unless --force)\n"
         << "  -l, --physics <name>     reference physics list name (default: QGSP_BIC_AllHP_EMZ)\n"
         << "  -j, --threads <count>    worker thread count; 1 runs sequential, > 1 runs multithreaded (default: all CPU cores)\n"
         << "  -v, --verbose <level>    Geant4 verbosity level; 0 prints only the banner, progress, and summary (default: 0)\n"
@@ -302,8 +305,7 @@ auto PrintUsage(const char* programName) -> void {
         << "  -h, --help               print this message\n"
         << "\n"
         << "a positional macroFile executes in batch mode and cannot be combined with --n-event or --ui;\n"
-        << "without --ui, --n-event, or a macroFile the program refuses to start"
-        << G4endl;
+        << "without --ui, --n-event, or a macroFile the program refuses to start" << G4endl;
 }
 
 auto ParseCommandLine(int argc, char** argv) -> Config {
@@ -322,10 +324,13 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
             config.mHelp = true;
         } else if (argument == "-m" or argument == "--material") {
             config.mLayers = ParseLayers(nextValue(i, argument));
-        } else if (argument == "-s" or argument == "--radiation-src") {
+        } else if (argument == "-s" or argument == "--rad-src") {
             config.mSources = ParseRadiationSources(nextValue(i, argument));
         } else if (argument == "-o" or argument == "--output") {
-            config.mOutputFileName = nextValue(i, argument);
+            config.mSave = true;
+            if (i + 1 < argc and argv[i + 1][0] != '-') {
+                config.mOutputFileName = nextValue(i, argument);
+            }
         } else if (argument == "-l" or argument == "--physics") {
             config.mPhysicsListName = nextValue(i, argument);
         } else if (argument == "-j" or argument == "--threads") {
@@ -363,7 +368,7 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
             throw std::invalid_argument("required option --material is missing");
         }
         if (config.mSources.empty()) {
-            throw std::invalid_argument("required option --radiation-src is missing");
+            throw std::invalid_argument("required option --rad-src is missing");
         }
         if (config.mThreads < 1) {
             throw std::invalid_argument("--threads must be at least 1");
@@ -724,11 +729,11 @@ public:
     }
 
     auto BeginOfRunAction(const G4Run* run) -> void override {
-        if (IsMaster()) {
+        if (IsMaster() and mConfig.mSave) {
             OutputWriter::Instance().BeginRun(run->GetRunID(), static_cast<int>(mConfig.mLayers.size()),
                                               static_cast<int>(mConfig.mSources.size()));
         }
-        if (not IsMaster() or not G4Threading::IsMultithreadedApplication()) {
+        if (mConfig.mSave and (not IsMaster() or not G4Threading::IsMultithreadedApplication())) {
             mFillContexts.clear();
             mFillContexts.reserve(mConfig.mSources.size());
             for (auto sourceIndex{0}; sourceIndex < static_cast<int>(mConfig.mSources.size()); ++sourceIndex) {
@@ -740,7 +745,9 @@ public:
     auto EndOfRunAction(const G4Run* run) -> void override {
         FlushAndReleaseFillState();
         if (IsMaster()) {
-            OutputWriter::Instance().EndRun();
+            if (mConfig.mSave) {
+                OutputWriter::Instance().EndRun();
+            }
             PrintStatistics(static_cast<const SimulationRun&>(*run));
             G4cout << "run " << run->GetRunID() << " finished with " << run->GetNumberOfEvent() << " events" << G4endl;
         }
@@ -874,10 +881,11 @@ private:
 
 class EventAction : public G4UserEventAction {
 public:
-    explicit EventAction(RunAction& runAction, int layerCount, int sourceCount) :
+    explicit EventAction(RunAction& runAction, int layerCount, int sourceCount, bool saveResults) :
         mRunAction{runAction},
         mLayerCount{layerCount},
         mSourceCount{sourceCount},
+        mSaveResults{saveResults},
         mFillContexts(sourceCount),
         mEntries(sourceCount),
         mFillStatuses(sourceCount),
@@ -897,7 +905,7 @@ public:
 
     auto BeginOfEventAction(const G4Event*) -> void override {
         const auto runId = G4RunManager::GetRunManager()->GetCurrentRun()->GetRunID();
-        if (runId != mRunId) {
+        if (mSaveResults and runId != mRunId) {
             mRunId = runId;
             for (auto sourceIndex{0}; sourceIndex < mSourceCount; ++sourceIndex) {
                 // Weak references on purpose: the fill contexts are owned by RunAction and must be
@@ -945,43 +953,46 @@ public:
     }
 
     auto EndOfEventAction(const G4Event* event) -> void override {
-        const auto sourceIndex = mCurrentSourceIndex;
-        auto& fields = mFields[sourceIndex];
-        *fields.mEventId = event->GetEventID();
-        *fields.mTotalPenetrationEnergy = mTotalPenetrationEnergy;
-        *fields.mPenetrationParticles = mPenetrationParticles;
-        *fields.mPenetrationTheta = mPenetrationTheta;
-        *fields.mPenetrationPhi = mPenetrationPhi;
-        *fields.mPenetrationEnergy = mPenetrationEnergy;
-        *fields.mTotalDepositionEnergy = mTotalDepositionEnergy;
-        for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
-            *fields.mLayerEnergyDeposit[layerIndex] = mLayerEnergyDeposit[layerIndex];
-            *fields.mDepositionParticles[layerIndex] = mDepositionParticles[layerIndex];
-            *fields.mDepositionX[layerIndex] = mDepositionX[layerIndex];
-            *fields.mDepositionY[layerIndex] = mDepositionY[layerIndex];
-            *fields.mDepositionZ[layerIndex] = mDepositionZ[layerIndex];
-            *fields.mDepositionWeight[layerIndex] = mDepositionWeight[layerIndex];
-            *fields.mDepositionProcess[layerIndex] = mDepositionProcess[layerIndex];
-        }
-        *fields.mTotalBackscatteringEnergy = mTotalBackscatteringEnergy;
-        *fields.mBackscatteringParticles = mBackscatteringParticles;
-        *fields.mBackscatteringTheta = mBackscatteringTheta;
-        *fields.mBackscatteringPhi = mBackscatteringPhi;
-        *fields.mBackscatteringEnergy = mBackscatteringEnergy;
-        // Fill the entry into the RNTuple of the source category drawn for this event. Filling only
-        // buffers data in memory; the actual file write happens in the explicit FlushCluster call,
-        // which is serialized across all parallel writers through the file-access mutex.
-        const auto fillContext{mFillContexts[sourceIndex].lock()};
-        if (fillContext == nullptr) {
-            G4cerr << "error: RNTuple fill context for source " << sourceIndex << " is no longer available" << G4endl;
-        } else {
-            fillContext->FillNoFlush(*mEntries[sourceIndex], mFillStatuses[sourceIndex]);
-            if (mFillStatuses[sourceIndex].ShouldFlushCluster()) {
-                std::lock_guard<std::mutex> guard{OutputWriter::Instance().FileAccessMutex()};
-                fillContext->FlushCluster();
+        if (mSaveResults) {
+            const auto sourceIndex = mCurrentSourceIndex;
+            auto& fields = mFields[sourceIndex];
+            *fields.mEventId = event->GetEventID();
+            *fields.mTotalPenetrationEnergy = mTotalPenetrationEnergy;
+            *fields.mPenetrationParticles = mPenetrationParticles;
+            *fields.mPenetrationTheta = mPenetrationTheta;
+            *fields.mPenetrationPhi = mPenetrationPhi;
+            *fields.mPenetrationEnergy = mPenetrationEnergy;
+            *fields.mTotalDepositionEnergy = mTotalDepositionEnergy;
+            for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
+                *fields.mLayerEnergyDeposit[layerIndex] = mLayerEnergyDeposit[layerIndex];
+                *fields.mDepositionParticles[layerIndex] = mDepositionParticles[layerIndex];
+                *fields.mDepositionX[layerIndex] = mDepositionX[layerIndex];
+                *fields.mDepositionY[layerIndex] = mDepositionY[layerIndex];
+                *fields.mDepositionZ[layerIndex] = mDepositionZ[layerIndex];
+                *fields.mDepositionWeight[layerIndex] = mDepositionWeight[layerIndex];
+                *fields.mDepositionProcess[layerIndex] = mDepositionProcess[layerIndex];
+            }
+            *fields.mTotalBackscatteringEnergy = mTotalBackscatteringEnergy;
+            *fields.mBackscatteringParticles = mBackscatteringParticles;
+            *fields.mBackscatteringTheta = mBackscatteringTheta;
+            *fields.mBackscatteringPhi = mBackscatteringPhi;
+            *fields.mBackscatteringEnergy = mBackscatteringEnergy;
+            // Fill the entry into the RNTuple of the source category drawn for this event. Filling only
+            // buffers data in memory; the actual file write happens in the explicit FlushCluster call,
+            // which is serialized across all parallel writers through the file-access mutex.
+            const auto fillContext{mFillContexts[sourceIndex].lock()};
+            if (fillContext == nullptr) {
+                G4cerr << "error: RNTuple fill context for source " << sourceIndex << " is no longer available" << G4endl;
+            } else {
+                fillContext->FillNoFlush(*mEntries[sourceIndex], mFillStatuses[sourceIndex]);
+                if (mFillStatuses[sourceIndex].ShouldFlushCluster()) {
+                    std::lock_guard<std::mutex> guard{OutputWriter::Instance().FileAccessMutex()};
+                    fillContext->FlushCluster();
+                }
             }
         }
-        mRunAction.AddEventResult(sourceIndex, mTotalPenetrationEnergy, mLayerEnergyDeposit, mTotalBackscatteringEnergy);
+        mRunAction.AddEventResult(mCurrentSourceIndex, mTotalPenetrationEnergy, mLayerEnergyDeposit,
+                                  mTotalBackscatteringEnergy);
     }
 
     auto AddPenetration(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
@@ -1077,6 +1088,7 @@ private:
     RunAction& mRunAction;
     int mLayerCount{0};
     int mSourceCount{0};
+    bool mSaveResults{false};
     int mCurrentSourceIndex{0};
     int mRunId{-1};
     std::vector<std::weak_ptr<ROOT::RNTupleFillContext>> mFillContexts;
@@ -1237,7 +1249,7 @@ public:
         RunAction* runAction = new RunAction{mConfig};
         SetUserAction(runAction);
         EventAction* eventAction = new EventAction{*runAction, static_cast<int>(mConfig.mLayers.size()),
-                                                   static_cast<int>(mConfig.mSources.size())};
+                                                   static_cast<int>(mConfig.mSources.size()), mConfig.mSave};
         SetUserAction(eventAction);
         SetUserAction(new PrimaryGeneratorAction{mConfig, *eventAction});
         SetUserAction(new SteppingAction{*eventAction});
@@ -1298,7 +1310,9 @@ auto main(int argc, char** argv) -> int try {
 
     PPS::ValidateSources(config);
 
-    PPS::OutputWriter::Instance().Initialize(config.mOutputFileName, config.mOverwrite);
+    if (config.mSave) {
+        PPS::OutputWriter::Instance().Initialize(config.mOutputFileName, config.mOverwrite);
+    }
     runManager->SetUserInitialization(new PPS::ActionInitialization{config});
     const auto visManager = std::unique_ptr<G4VisExecutive>{new G4VisExecutive{"quiet"}};
     visManager->Initialize();
@@ -1324,11 +1338,14 @@ auto main(int argc, char** argv) -> int try {
     } else {
         uiManager->ApplyCommand("/run/beamOn " + std::to_string(config.mEventCount));
     }
-    PPS::OutputWriter::Instance().Finalize();
+    if (config.mSave) {
+        PPS::OutputWriter::Instance().Finalize();
+    }
 
     return EXIT_SUCCESS;
 } catch (const std::exception& error) {
     G4cerr << "error: " << error.what() << G4endl;
+    // Safe even when saving was disabled (no-op unless a ROOT file is open).
     PPS::OutputWriter::Instance().Finalize();
     std::quick_exit(EXIT_FAILURE);
 }
