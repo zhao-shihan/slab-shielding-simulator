@@ -571,7 +571,8 @@ public:
     struct SourceStatistics {
         explicit SourceStatistics(int layerCount) :
             mLayerDepositedEnergySums(layerCount, 0.0),
-            mLayerDepositedEnergySumsSq(layerCount, 0.0) {}
+            mLayerDepositedEnergySumsSq(layerCount, 0.0),
+            mLayerDepositedPrimaryCounts(layerCount, 0) {}
         long long mEventCount{0};
         double mPenetratingEnergySum{0.0};
         double mPenetratingEnergySumSq{0.0};
@@ -581,6 +582,9 @@ public:
         std::vector<double> mLayerDepositedEnergySumsSq;
         double mBackscatteredEnergySum{0.0};
         double mBackscatteredEnergySumSq{0.0};
+        long long mPenetratingPrimaryCount{0};
+        std::vector<long long> mLayerDepositedPrimaryCounts;
+        long long mBackscatteredPrimaryCount{0};
         std::map<std::string, double> mPenetratingParticleCount;
         std::map<std::string, double> mPenetratingParticleEnergySum;
         std::map<std::string, double> mPenetratingParticleEnergySumSq;
@@ -610,6 +614,11 @@ public:
             }
             target.mBackscatteredEnergySum += source.mBackscatteredEnergySum;
             target.mBackscatteredEnergySumSq += source.mBackscatteredEnergySumSq;
+            target.mPenetratingPrimaryCount += source.mPenetratingPrimaryCount;
+            for (auto layerIndex{0}; layerIndex < static_cast<int>(target.mLayerDepositedPrimaryCounts.size()); ++layerIndex) {
+                target.mLayerDepositedPrimaryCounts[layerIndex] += source.mLayerDepositedPrimaryCounts[layerIndex];
+            }
+            target.mBackscatteredPrimaryCount += source.mBackscatteredPrimaryCount;
             AddToMap(target.mPenetratingParticleCount, source.mPenetratingParticleCount);
             AddToMap(target.mPenetratingParticleEnergySum, source.mPenetratingParticleEnergySum);
             AddToMap(target.mPenetratingParticleEnergySumSq, source.mPenetratingParticleEnergySumSq);
@@ -652,6 +661,18 @@ public:
         statistics.mBackscatteredParticleEnergySumSq[particleName] += energy * energy;
     }
 
+    auto AddPrimaryPenetrating(int sourceIndex) -> void {
+        ++mSourceStatistics[sourceIndex].mPenetratingPrimaryCount;
+    }
+
+    auto AddPrimaryDeposited(int sourceIndex, int layerIndex) -> void {
+        ++mSourceStatistics[sourceIndex].mLayerDepositedPrimaryCounts[layerIndex];
+    }
+
+    auto AddPrimaryBackscattered(int sourceIndex) -> void {
+        ++mSourceStatistics[sourceIndex].mBackscatteredPrimaryCount;
+    }
+
     auto GetStatistics(int sourceIndex) const -> const SourceStatistics& {
         return mSourceStatistics[sourceIndex];
     }
@@ -670,6 +691,11 @@ public:
             }
             total.mBackscatteredEnergySum += statistics.mBackscatteredEnergySum;
             total.mBackscatteredEnergySumSq += statistics.mBackscatteredEnergySumSq;
+            total.mPenetratingPrimaryCount += statistics.mPenetratingPrimaryCount;
+            for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
+                total.mLayerDepositedPrimaryCounts[layerIndex] += statistics.mLayerDepositedPrimaryCounts[layerIndex];
+            }
+            total.mBackscatteredPrimaryCount += statistics.mBackscatteredPrimaryCount;
             AddToMap(total.mPenetratingParticleCount, statistics.mPenetratingParticleCount);
             AddToMap(total.mPenetratingParticleEnergySum, statistics.mPenetratingParticleEnergySum);
             AddToMap(total.mPenetratingParticleEnergySumSq, statistics.mPenetratingParticleEnergySumSq);
@@ -749,6 +775,18 @@ public:
         mCurrentRun->AddBackscatteredEnergy(sourceIndex, particleName, energy);
     }
 
+    auto AddPrimaryPenetrating(int sourceIndex) -> void {
+        mCurrentRun->AddPrimaryPenetrating(sourceIndex);
+    }
+
+    auto AddPrimaryDeposited(int sourceIndex, int layerIndex) -> void {
+        mCurrentRun->AddPrimaryDeposited(sourceIndex, layerIndex);
+    }
+
+    auto AddPrimaryBackscattered(int sourceIndex) -> void {
+        mCurrentRun->AddPrimaryBackscattered(sourceIndex);
+    }
+
     auto GetFillContext(int sourceIndex) const -> std::shared_ptr<ROOT::RNTupleFillContext> {
         return mFillContexts[sourceIndex];
     }
@@ -784,15 +822,18 @@ private:
         for (const auto& source : mConfig.mSources) {
             effectiveIncidentEnergy += source.mWeight * source.mEnergy;
         }
-        PrintSourceBlock("total: " + std::to_string(eventCount) + " events",
-                         run.GetTotalStatistics(), effectiveIncidentEnergy);
+        auto printedAnyBlock{false};
         for (auto sourceIndex{0}; sourceIndex < run.GetSourceCount(); ++sourceIndex) {
             const auto& source = mConfig.mSources[sourceIndex];
             const auto& statistics = run.GetStatistics(sourceIndex);
             if (statistics.mEventCount < 1) {
                 continue;
             }
-            G4cout << "-------------------------------------------------------------------------------\n";
+            if (printedAnyBlock) {
+                // Separator between consecutive source blocks.
+                G4cout << "-------------------------------------------------------------------------------\n";
+            }
+            printedAnyBlock = true;
             auto header = std::ostringstream{};
             header << "source " << sourceIndex << ": " << source.mParticleName << ' '
                    << G4BestUnit(source.mEnergy, "Energy") << ", intensity "
@@ -800,6 +841,10 @@ private:
                    << statistics.mEventCount << " events";
             PrintSourceBlock(header.str(), statistics, source.mEnergy);
         }
+        // Aggregated total block is printed last.
+        G4cout << "-------------------------------------------------------------------------------\n";
+        PrintSourceBlock("total: " + std::to_string(eventCount) + " events",
+                         run.GetTotalStatistics(), effectiveIncidentEnergy);
         G4cout << "===============================================================================\n"
                << G4endl;
     }
@@ -808,9 +853,9 @@ private:
                           double incidentEnergy) -> void {
         G4cout << ' ' << header << ":\n";
         G4cout << std::defaultfloat << std::setprecision(6);
-        PrintEnergyRatio("penetrating energy ratio", statistics.mPenetratingEnergySum,
+        PrintEnergyRatio("energy penetration ratio", statistics.mPenetratingEnergySum,
                          statistics.mPenetratingEnergySumSq, statistics.mEventCount, incidentEnergy);
-        PrintEnergyRatio("deposited energy ratio", statistics.mDepositedEnergySum,
+        PrintEnergyRatio("energy deposition ratio", statistics.mDepositedEnergySum,
                          statistics.mDepositedEnergySumSq, statistics.mEventCount, incidentEnergy);
         for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
             const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
@@ -819,14 +864,42 @@ private:
                              statistics.mLayerDepositedEnergySumsSq[layerIndex], statistics.mEventCount,
                              incidentEnergy);
         }
-        PrintEnergyRatio("back-scattered energy ratio", statistics.mBackscatteredEnergySum,
+        PrintEnergyRatio("energy backscattering ratio", statistics.mBackscatteredEnergySum,
                          statistics.mBackscatteredEnergySumSq, statistics.mEventCount, incidentEnergy);
+        // Primary-particle termination statistics: the fraction of primaries that end up before,
+        // inside, or after the material. For unstable primaries the termination position includes
+        // decay. The counts are mutually exclusive and sum to the event count of the block.
+        auto totalDepositedPrimaryCount{0LL};
+        for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
+            totalDepositedPrimaryCount += statistics.mLayerDepositedPrimaryCounts[layerIndex];
+        }
+        PrintPrimaryRatio("primary particle penetration ratio", statistics.mPenetratingPrimaryCount,
+                          statistics.mEventCount);
+        PrintPrimaryRatio("primary particle deposition ratio", totalDepositedPrimaryCount, statistics.mEventCount);
+        for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
+            const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
+                               mConfig.mLayers[layerIndex].mMaterialName + ')';
+            PrintPrimaryRatio(label, statistics.mLayerDepositedPrimaryCounts[layerIndex], statistics.mEventCount);
+        }
+        PrintPrimaryRatio("primary particle backscattering ratio", statistics.mBackscatteredPrimaryCount,
+                          statistics.mEventCount);
         PrintParticleStatistics("penetrating particles", statistics.mPenetratingParticleCount,
                                 statistics.mPenetratingParticleEnergySum,
                                 statistics.mPenetratingParticleEnergySumSq);
-        PrintParticleStatistics("back-scattered particles", statistics.mBackscatteredParticleCount,
+        PrintParticleStatistics("backscattered particles", statistics.mBackscatteredParticleCount,
                                 statistics.mBackscatteredParticleEnergySum,
                                 statistics.mBackscatteredParticleEnergySumSq);
+    }
+
+    auto PrintPrimaryRatio(const std::string& label, long long count, long long eventCount) -> void {
+        if (eventCount < 1) {
+            return;
+        }
+        const auto proportion{static_cast<double>(count) / eventCount};
+        // Standard error of the binomial proportion.
+        const auto proportionError{std::sqrt(proportion * (1.0 - proportion) / eventCount)};
+        G4cout << "   " << std::left << std::setw(45) << label << '(' << 100.0 * proportion << " +/- "
+               << 100.0 * proportionError << ") %" << G4endl;
     }
 
     auto PrintParticleStatistics(const std::string& title, const std::map<std::string, double>& particleCounts,
@@ -835,7 +908,7 @@ private:
         if (particleCounts.empty()) {
             return;
         }
-        G4cout << "   " << title << ":\n";
+        G4cout << "   " << title << '\n';
         G4cout << "     "
                << std::setw(14) << "particle"
                << std::setw(20) << "<E>"
@@ -1012,6 +1085,18 @@ public:
         mRunAction.AddBackscatteredEnergy(mCurrentSourceIndex, particleName, energy);
     }
 
+    auto AddPrimaryPenetrating() -> void {
+        mRunAction.AddPrimaryPenetrating(mCurrentSourceIndex);
+    }
+
+    auto AddPrimaryDeposited(int layerIndex) -> void {
+        mRunAction.AddPrimaryDeposited(mCurrentSourceIndex, layerIndex);
+    }
+
+    auto AddPrimaryBackscattered() -> void {
+        mRunAction.AddPrimaryBackscattered(mCurrentSourceIndex);
+    }
+
 private:
     struct SourceFields {
         std::shared_ptr<int> mEventId;
@@ -1143,18 +1228,45 @@ private:
 
 class TrackingAction : public G4UserTrackingAction {
 public:
-    explicit TrackingAction(EventAction& eventAction, bool includeNeutrinos) :
+    explicit TrackingAction(EventAction& eventAction, const Config& config) :
         mEventAction{eventAction},
-        mIncludeNeutrinos{includeNeutrinos} {}
+        mConfig{config} {}
     ~TrackingAction() override = default;
 
     auto PostUserTrackingAction(const G4Track* track) -> void override {
         const auto step = track->GetStep();
-        if (step->GetPostStepPoint()->GetStepStatus() != fWorldBoundary) {
+        const auto postStepPoint = step->GetPostStepPoint();
+        // Primary-particle termination statistics (track id 1): classify where the primary ends up.
+        // For unstable primaries this includes decay, because the final step position is the decay
+        // vertex. The categories are mutually exclusive and exhaustive by the final z coordinate:
+        //   z < 0                    -> terminated before the material (backscattered)
+        //   0 <= z < totalThickness  -> terminated inside a material layer (deposited)
+        //   z >= totalThickness      -> terminated after the material (penetrating)
+        if (track->GetTrackID() == 1) {
+            const auto z = postStepPoint->GetPosition().z();
+            const auto totalThickness = mConfig.TotalThickness();
+            if (z < 0.0) {
+                mEventAction.AddPrimaryBackscattered();
+            } else if (z >= totalThickness) {
+                mEventAction.AddPrimaryPenetrating();
+            } else {
+                auto cumulative{0.0};
+                auto layerIndex{0};
+                for (auto i{0}; i < static_cast<int>(mConfig.mLayers.size()); ++i) {
+                    cumulative += mConfig.mLayers[i].mThickness;
+                    if (z < cumulative) {
+                        layerIndex = i;
+                        break;
+                    }
+                }
+                mEventAction.AddPrimaryDeposited(layerIndex);
+            }
+        }
+        if (postStepPoint->GetStepStatus() != fWorldBoundary) {
             return;
         }
         const auto definition = track->GetDefinition();
-        if (not mIncludeNeutrinos and IsNeutrino(definition)) {
+        if (not mConfig.mIncludeNeutrinos and IsNeutrino(definition)) {
             return;
         }
         const auto direction = track->GetMomentumDirection();
@@ -1169,7 +1281,7 @@ public:
 
 private:
     EventAction& mEventAction;
-    bool mIncludeNeutrinos{false};
+    const Config& mConfig;
 };
 
 class PrimaryGeneratorAction : public G4VUserPrimaryGeneratorAction {
@@ -1246,7 +1358,7 @@ public:
         SetUserAction(eventAction);
         SetUserAction(new PrimaryGeneratorAction{mConfig, *eventAction});
         SetUserAction(new SteppingAction{*eventAction});
-        SetUserAction(new TrackingAction{*eventAction, mConfig.mIncludeNeutrinos});
+        SetUserAction(new TrackingAction{*eventAction, mConfig});
     }
 
 private:
