@@ -51,6 +51,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +69,11 @@ auto DefaultThreadCount() -> int {
     const auto coreCount = std::thread::hardware_concurrency();
     return coreCount > 0 ? static_cast<int>(coreCount) : 1;
 }
+
+// Geometry tolerances used to keep the world boundary snug around the material slab with only a
+// tiny vacuum gap, and to place the primary just in front of the slab.
+const auto absTol = 1.0 * angstrom;
+constexpr auto relTol = std::numeric_limits<float>::epsilon();
 
 enum struct MaterialCompositionType {
     nist,
@@ -142,7 +148,6 @@ auto ParseQuantity(const std::string& text, const std::map<std::string, double>&
         }
         value *= unit->second;
     }
-    // Reject NaN/inf and unit overflows (e.g. "1e308 MeV").
     if (not std::isfinite(value)) {
         throw std::invalid_argument("non-finite numeric value in '" + text + "'");
     }
@@ -193,7 +198,6 @@ auto ParseDensity(const std::string& text) -> double {
         throw std::invalid_argument("cannot parse numeric value from '" + text + "'");
     }
     stream >> suffix;
-    // A bare number is interpreted in g/cm3, the conventional density unit.
     auto unit = g / cm3;
     if (suffix == "g/cm3" or suffix == "g/mL" or suffix == "g/ml") {
         unit = g / cm3;
@@ -281,7 +285,6 @@ auto ParseLayerSpec(const std::string& layerSpec) -> Layer {
         }
         const auto compositionSpec = Trim(remainder.substr(1, closingPos - 1));
         remainder = remainder.substr(closingPos + 1);
-        // The remainder has the form ':density:thickness'.
         if (remainder.empty() or remainder.front() != ':') {
             throw std::invalid_argument("layer '" + layerSpec + "' is missing its density or thickness");
         }
@@ -700,7 +703,7 @@ public:
 
         const auto totalThickness = mConfig.TotalThickness();
         const auto xyHalfLength{500.0 * totalThickness};
-        const auto worldZHalfLength{1.1 * totalThickness};
+        const auto worldZHalfLength{(0.5 + 2.0 * relTol) * totalThickness + 2.0 * absTol};
 
         const auto solidWorld = new G4Box{"World", xyHalfLength, xyHalfLength, worldZHalfLength};
         const auto logicalWorld = new G4LogicalVolume{solidWorld, vacuumMaterial, "World"};
@@ -709,7 +712,7 @@ public:
             mConfig.mVerbose > 0};
 
         auto layerIndex{0};
-        auto zPosition{0.0};
+        auto zPosition{-0.5 * totalThickness};
         for (const auto& layer : mConfig.mLayers) {
             const auto layerHalfLength = 0.5 * layer.mThickness;
             const auto solidLayer = new G4Box{"LayerSolid", xyHalfLength, xyHalfLength, layerHalfLength};
@@ -1037,8 +1040,6 @@ private:
         }
         G4cout << '\n';
         G4cout << "===============================================================================\n";
-        // Effective incident energy of the compound source (intensity-weighted mean of the
-        // per-source energies), used to normalize the aggregated total ratios.
         auto effectiveIncidentEnergy{0.0};
         for (const auto& source : mConfig.mSources) {
             effectiveIncidentEnergy += source.mWeight * source.mEnergy;
@@ -1051,7 +1052,6 @@ private:
                 continue;
             }
             if (printedAnyBlock) {
-                // Separator between consecutive source blocks.
                 G4cout << "-------------------------------------------------------------------------------\n";
             }
             printedAnyBlock = true;
@@ -1062,7 +1062,6 @@ private:
                    << statistics.mEventCount << " events";
             PrintSourceBlock(header.str(), statistics, source.mEnergy);
         }
-        // Aggregated total block is printed last.
         G4cout << "-------------------------------------------------------------------------------\n";
         PrintSourceBlock("total: " + std::to_string(mConfig.mSources.size()) + " components, " + std::to_string(eventCount) + " events",
                          run.GetTotalStatistics(), effectiveIncidentEnergy);
@@ -1087,9 +1086,6 @@ private:
         }
         PrintEnergyRatio("energy backscattering ratio", statistics.mBackscatteredEnergySum,
                          statistics.mBackscatteredEnergySumSq, statistics.mEventCount, incidentEnergy);
-        // Primary-particle termination statistics: the fraction of primaries that end up before,
-        // inside, or after the material. For unstable primaries the termination position includes
-        // decay. The counts are mutually exclusive and sum to the event count of the block.
         auto totalDepositedPrimaryCount{0LL};
         for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
             totalDepositedPrimaryCount += statistics.mLayerDepositedPrimaryCounts[layerIndex];
@@ -1117,7 +1113,6 @@ private:
             return;
         }
         const auto proportion{static_cast<double>(count) / eventCount};
-        // Standard error of the binomial proportion.
         const auto proportionError{std::sqrt(proportion * (1.0 - proportion) / eventCount)};
         G4cout << "   " << std::left << std::setw(45) << label + ':' << '(' << 100.0 * proportion << " +/- "
                << 100.0 * proportionError << ") %" << G4endl;
@@ -1242,8 +1237,6 @@ public:
             const auto sourceIndex = mCurrentSourceIndex;
             auto& fields = mFields[sourceIndex];
             *fields.mEventId = event->GetEventID();
-            // All per-event computations are performed in double; the values are narrowed to the
-            // float RNTuple fields exactly here, at the storage boundary.
             *fields.mTotalPenetratingEnergy = static_cast<float>(mTotalPenetratingEnergy);
             *fields.mPenetratingParticles = mPenetratingParticles;
             fields.mPenetratingTheta->assign(mPenetratingTheta.begin(), mPenetratingTheta.end());
@@ -1422,14 +1415,14 @@ public:
     ~SteppingAction() override = default;
 
     auto UserSteppingAction(const G4Step* step) -> void override {
-        if (mMaterialVolumes.empty()) {
+        if (mMaterialVolumes == nullptr) {
             const DetectorConstruction* detectorConstruction = static_cast<const DetectorConstruction*>(
                 G4RunManager::GetRunManager()->GetUserDetectorConstruction());
-            mMaterialVolumes = detectorConstruction->GetMaterialVolumes();
+            mMaterialVolumes = &detectorConstruction->GetMaterialVolumes();
         }
         const auto logicalVolume = step->GetPreStepPoint()->GetTouchableHandle()->GetVolume()->GetLogicalVolume();
-        const auto layerIt = mMaterialVolumes.find(logicalVolume);
-        if (layerIt == mMaterialVolumes.end()) {
+        const auto layerIt = mMaterialVolumes->find(logicalVolume);
+        if (layerIt == mMaterialVolumes->end()) {
             return;
         }
         const auto layerIndex = layerIt->second;
@@ -1445,7 +1438,7 @@ public:
 
 private:
     EventAction& mEventAction;
-    std::unordered_map<const G4LogicalVolume*, int> mMaterialVolumes;
+    const std::unordered_map<const G4LogicalVolume*, int>* mMaterialVolumes{nullptr};
 };
 
 class TrackingAction : public G4UserTrackingAction {
@@ -1458,31 +1451,10 @@ public:
     auto PostUserTrackingAction(const G4Track* track) -> void override {
         const auto step = track->GetStep();
         const auto postStepPoint = step->GetPostStepPoint();
-        // Primary-particle termination statistics (track id 1): classify where the primary ends up.
-        // For unstable primaries this includes decay, because the final step position is the decay
-        // vertex. The categories are mutually exclusive and exhaustive by the final z coordinate:
-        //   z < 0                    -> terminated before the material (backscattered)
-        //   0 <= z < totalThickness  -> terminated inside a material layer (deposited)
-        //   z >= totalThickness      -> terminated after the material (penetrating)
+        // Primary-particle termination statistics; for unstable primaries the final step position is
+        // the decay vertex, so decay is included automatically.
         if (track->GetTrackID() == 1) {
-            const auto z = postStepPoint->GetPosition().z();
-            const auto totalThickness = mConfig.TotalThickness();
-            if (z < 0.0) {
-                mEventAction.AddPrimaryBackscattered();
-            } else if (z >= totalThickness) {
-                mEventAction.AddPrimaryPenetrating();
-            } else {
-                auto cumulative{0.0};
-                auto layerIndex{0};
-                for (auto i{0}; i < static_cast<int>(mConfig.mLayers.size()); ++i) {
-                    cumulative += mConfig.mLayers[i].mThickness;
-                    if (z < cumulative) {
-                        layerIndex = i;
-                        break;
-                    }
-                }
-                mEventAction.AddPrimaryDeposited(layerIndex);
-            }
+            ClassifyPrimaryTermination(postStepPoint);
         }
         if (postStepPoint->GetStepStatus() != fWorldBoundary) {
             return;
@@ -1502,8 +1474,39 @@ public:
     }
 
 private:
+    auto ClassifyPrimaryTermination(const G4StepPoint* postStepPoint) -> void {
+        if (mMaterialVolumes == nullptr) {
+            const DetectorConstruction* detectorConstruction = static_cast<const DetectorConstruction*>(
+                G4RunManager::GetRunManager()->GetUserDetectorConstruction());
+            mMaterialVolumes = &detectorConstruction->GetMaterialVolumes();
+        }
+        const auto z = postStepPoint->GetPosition().z();
+        if (postStepPoint->GetStepStatus() == fWorldBoundary) {
+            if (z < 0.0) {
+                mEventAction.AddPrimaryBackscattered();
+            } else {
+                mEventAction.AddPrimaryPenetrating();
+            }
+            return;
+        }
+        const auto volume = postStepPoint->GetTouchableHandle()->GetVolume();
+        if (volume != nullptr) {
+            const auto layerIt = mMaterialVolumes->find(volume->GetLogicalVolume());
+            if (layerIt != mMaterialVolumes->end()) {
+                mEventAction.AddPrimaryDeposited(layerIt->second);
+                return;
+            }
+        }
+        if (z >= 0.0) {
+            mEventAction.AddPrimaryPenetrating();
+        } else {
+            mEventAction.AddPrimaryBackscattered();
+        }
+    }
+
     EventAction& mEventAction;
     const Config& mConfig;
+    const std::unordered_map<const G4LogicalVolume*, int>* mMaterialVolumes{nullptr};
 };
 
 class PrimaryGeneratorAction : public G4VUserPrimaryGeneratorAction {
@@ -1528,6 +1531,9 @@ public:
         }
         // Guard against floating-point rounding in the last interval.
         mCumulativeProbabilities.back() = 1.0;
+        // The primary starts just in front of the material slab (whose front face is at -d/2),
+        // leaving only a tiny vacuum gap before the material.
+        mSourcePosition = G4ThreeVector{0.0, 0.0, -(0.5 + relTol) * config.TotalThickness() - absTol};
         mParticleGun = std::make_unique<G4ParticleGun>(1);
         mParticleGun->SetParticleMomentumDirection(G4ThreeVector{0.0, 0.0, 1.0});
     }
