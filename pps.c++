@@ -568,6 +568,27 @@ private:
 
 class SimulationRun : public G4Run {
 public:
+    struct SourceStatistics {
+        explicit SourceStatistics(int layerCount) :
+            mLayerDepositedEnergySums(layerCount, 0.0),
+            mLayerDepositedEnergySumsSq(layerCount, 0.0) {}
+        long long mEventCount{0};
+        double mPenetratingEnergySum{0.0};
+        double mPenetratingEnergySumSq{0.0};
+        double mDepositedEnergySum{0.0};
+        double mDepositedEnergySumSq{0.0};
+        std::vector<double> mLayerDepositedEnergySums;
+        std::vector<double> mLayerDepositedEnergySumsSq;
+        double mBackscatteredEnergySum{0.0};
+        double mBackscatteredEnergySumSq{0.0};
+        std::map<std::string, double> mPenetratingParticleCount;
+        std::map<std::string, double> mPenetratingParticleEnergySum;
+        std::map<std::string, double> mPenetratingParticleEnergySumSq;
+        std::map<std::string, double> mBackscatteredParticleCount;
+        std::map<std::string, double> mBackscatteredParticleEnergySum;
+        std::map<std::string, double> mBackscatteredParticleEnergySumSq;
+    };
+
     explicit SimulationRun(int layerCount, int sourceCount) :
         mSourceStatistics(sourceCount, SourceStatistics{layerCount}),
         mLayerCount{layerCount} {}
@@ -579,133 +600,95 @@ public:
             auto& target = mSourceStatistics[sourceIndex];
             const auto& source = otherSimulationRun->mSourceStatistics[sourceIndex];
             target.mEventCount += source.mEventCount;
-            target.mPenetrationEnergySum += source.mPenetrationEnergySum;
-            target.mPenetrationEnergySumSq += source.mPenetrationEnergySumSq;
-            target.mDepositionEnergySum += source.mDepositionEnergySum;
-            target.mDepositionEnergySumSq += source.mDepositionEnergySumSq;
-            for (auto layerIndex{0}; layerIndex < static_cast<int>(target.mLayerDepositionEnergySums.size()); ++layerIndex) {
-                target.mLayerDepositionEnergySums[layerIndex] += source.mLayerDepositionEnergySums[layerIndex];
-                target.mLayerDepositionEnergySumsSq[layerIndex] += source.mLayerDepositionEnergySumsSq[layerIndex];
+            target.mPenetratingEnergySum += source.mPenetratingEnergySum;
+            target.mPenetratingEnergySumSq += source.mPenetratingEnergySumSq;
+            target.mDepositedEnergySum += source.mDepositedEnergySum;
+            target.mDepositedEnergySumSq += source.mDepositedEnergySumSq;
+            for (auto layerIndex{0}; layerIndex < static_cast<int>(target.mLayerDepositedEnergySums.size()); ++layerIndex) {
+                target.mLayerDepositedEnergySums[layerIndex] += source.mLayerDepositedEnergySums[layerIndex];
+                target.mLayerDepositedEnergySumsSq[layerIndex] += source.mLayerDepositedEnergySumsSq[layerIndex];
             }
-            target.mBackscatteringEnergySum += source.mBackscatteringEnergySum;
-            target.mBackscatteringEnergySumSq += source.mBackscatteringEnergySumSq;
-            AddToMap(target.mPenetrationParticleCount, source.mPenetrationParticleCount);
-            AddToMap(target.mPenetrationParticleEnergySum, source.mPenetrationParticleEnergySum);
-            AddToMap(target.mPenetrationParticleEnergySumSq, source.mPenetrationParticleEnergySumSq);
-            AddToMap(target.mBackscatteringParticleCount, source.mBackscatteringParticleCount);
-            AddToMap(target.mBackscatteringParticleEnergySum, source.mBackscatteringParticleEnergySum);
-            AddToMap(target.mBackscatteringParticleEnergySumSq, source.mBackscatteringParticleEnergySumSq);
+            target.mBackscatteredEnergySum += source.mBackscatteredEnergySum;
+            target.mBackscatteredEnergySumSq += source.mBackscatteredEnergySumSq;
+            AddToMap(target.mPenetratingParticleCount, source.mPenetratingParticleCount);
+            AddToMap(target.mPenetratingParticleEnergySum, source.mPenetratingParticleEnergySum);
+            AddToMap(target.mPenetratingParticleEnergySumSq, source.mPenetratingParticleEnergySumSq);
+            AddToMap(target.mBackscatteredParticleCount, source.mBackscatteredParticleCount);
+            AddToMap(target.mBackscatteredParticleEnergySum, source.mBackscatteredParticleEnergySum);
+            AddToMap(target.mBackscatteredParticleEnergySumSq, source.mBackscatteredParticleEnergySumSq);
         }
     }
 
-    auto AddEventResult(int sourceIndex, double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
-                        double backscatteringEnergy) -> void {
+    auto AddEventResult(int sourceIndex, double penetratingEnergy, const std::vector<float>& layerDepositedEnergies,
+                        double backscatteredEnergy) -> void {
         auto& statistics = mSourceStatistics[sourceIndex];
         ++statistics.mEventCount;
-        statistics.mPenetrationEnergySum += penetrationEnergy;
-        statistics.mPenetrationEnergySumSq += penetrationEnergy * penetrationEnergy;
-        auto totalDepositionEnergy{0.0};
-        for (auto layerIndex{0}; layerIndex < static_cast<int>(layerDepositionEnergies.size()); ++layerIndex) {
-            const auto layerDepositionEnergy = layerDepositionEnergies[layerIndex];
-            statistics.mLayerDepositionEnergySums[layerIndex] += layerDepositionEnergy;
-            statistics.mLayerDepositionEnergySumsSq[layerIndex] += layerDepositionEnergy * layerDepositionEnergy;
-            totalDepositionEnergy += layerDepositionEnergy;
+        statistics.mPenetratingEnergySum += penetratingEnergy;
+        statistics.mPenetratingEnergySumSq += penetratingEnergy * penetratingEnergy;
+        auto totalDepositedEnergy{0.0};
+        for (auto layerIndex{0}; layerIndex < static_cast<int>(layerDepositedEnergies.size()); ++layerIndex) {
+            const auto layerDepositedEnergy = layerDepositedEnergies[layerIndex];
+            statistics.mLayerDepositedEnergySums[layerIndex] += layerDepositedEnergy;
+            statistics.mLayerDepositedEnergySumsSq[layerIndex] += layerDepositedEnergy * layerDepositedEnergy;
+            totalDepositedEnergy += layerDepositedEnergy;
         }
-        statistics.mDepositionEnergySum += totalDepositionEnergy;
-        statistics.mDepositionEnergySumSq += totalDepositionEnergy * totalDepositionEnergy;
-        statistics.mBackscatteringEnergySum += backscatteringEnergy;
-        statistics.mBackscatteringEnergySumSq += backscatteringEnergy * backscatteringEnergy;
+        statistics.mDepositedEnergySum += totalDepositedEnergy;
+        statistics.mDepositedEnergySumSq += totalDepositedEnergy * totalDepositedEnergy;
+        statistics.mBackscatteredEnergySum += backscatteredEnergy;
+        statistics.mBackscatteredEnergySumSq += backscatteredEnergy * backscatteredEnergy;
     }
 
-    auto AddPenetrationEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+    auto AddPenetratingEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
         auto& statistics = mSourceStatistics[sourceIndex];
-        statistics.mPenetrationParticleCount[particleName] += 1.0;
-        statistics.mPenetrationParticleEnergySum[particleName] += energy;
-        statistics.mPenetrationParticleEnergySumSq[particleName] += energy * energy;
+        statistics.mPenetratingParticleCount[particleName] += 1.0;
+        statistics.mPenetratingParticleEnergySum[particleName] += energy;
+        statistics.mPenetratingParticleEnergySumSq[particleName] += energy * energy;
     }
 
-    auto AddBackscatteringEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+    auto AddBackscatteredEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
         auto& statistics = mSourceStatistics[sourceIndex];
-        statistics.mBackscatteringParticleCount[particleName] += 1.0;
-        statistics.mBackscatteringParticleEnergySum[particleName] += energy;
-        statistics.mBackscatteringParticleEnergySumSq[particleName] += energy * energy;
+        statistics.mBackscatteredParticleCount[particleName] += 1.0;
+        statistics.mBackscatteredParticleEnergySum[particleName] += energy;
+        statistics.mBackscatteredParticleEnergySumSq[particleName] += energy * energy;
     }
 
-    auto GetEventCount(int sourceIndex) const -> long long {
-        return mSourceStatistics[sourceIndex].mEventCount;
+    auto GetStatistics(int sourceIndex) const -> const SourceStatistics& {
+        return mSourceStatistics[sourceIndex];
     }
-    auto GetPenetrationEnergySum(int sourceIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mPenetrationEnergySum;
+
+    auto GetTotalStatistics() const -> SourceStatistics {
+        auto total = SourceStatistics{mLayerCount};
+        for (const auto& statistics : mSourceStatistics) {
+            total.mEventCount += statistics.mEventCount;
+            total.mPenetratingEnergySum += statistics.mPenetratingEnergySum;
+            total.mPenetratingEnergySumSq += statistics.mPenetratingEnergySumSq;
+            total.mDepositedEnergySum += statistics.mDepositedEnergySum;
+            total.mDepositedEnergySumSq += statistics.mDepositedEnergySumSq;
+            for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
+                total.mLayerDepositedEnergySums[layerIndex] += statistics.mLayerDepositedEnergySums[layerIndex];
+                total.mLayerDepositedEnergySumsSq[layerIndex] += statistics.mLayerDepositedEnergySumsSq[layerIndex];
+            }
+            total.mBackscatteredEnergySum += statistics.mBackscatteredEnergySum;
+            total.mBackscatteredEnergySumSq += statistics.mBackscatteredEnergySumSq;
+            AddToMap(total.mPenetratingParticleCount, statistics.mPenetratingParticleCount);
+            AddToMap(total.mPenetratingParticleEnergySum, statistics.mPenetratingParticleEnergySum);
+            AddToMap(total.mPenetratingParticleEnergySumSq, statistics.mPenetratingParticleEnergySumSq);
+            AddToMap(total.mBackscatteredParticleCount, statistics.mBackscatteredParticleCount);
+            AddToMap(total.mBackscatteredParticleEnergySum, statistics.mBackscatteredParticleEnergySum);
+            AddToMap(total.mBackscatteredParticleEnergySumSq, statistics.mBackscatteredParticleEnergySumSq);
+        }
+        return total;
     }
-    auto GetPenetrationEnergySumSq(int sourceIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mPenetrationEnergySumSq;
-    }
-    auto GetDepositionEnergySum(int sourceIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mDepositionEnergySum;
-    }
-    auto GetDepositionEnergySumSq(int sourceIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mDepositionEnergySumSq;
-    }
-    auto GetLayerDepositionEnergySum(int sourceIndex, int layerIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mLayerDepositionEnergySums[layerIndex];
-    }
-    auto GetLayerDepositionEnergySumSq(int sourceIndex, int layerIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mLayerDepositionEnergySumsSq[layerIndex];
-    }
+
     auto GetLayerCount() const -> int {
         return mLayerCount;
     }
     auto GetSourceCount() const -> int {
         return static_cast<int>(mSourceStatistics.size());
     }
-    auto GetBackscatteringEnergySum(int sourceIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mBackscatteringEnergySum;
-    }
-    auto GetBackscatteringEnergySumSq(int sourceIndex) const -> double {
-        return mSourceStatistics[sourceIndex].mBackscatteringEnergySumSq;
-    }
-    auto GetPenetrationParticleCounts(int sourceIndex) const -> const std::map<std::string, double>& {
-        return mSourceStatistics[sourceIndex].mPenetrationParticleCount;
-    }
-    auto GetPenetrationParticleEnergySums(int sourceIndex) const -> const std::map<std::string, double>& {
-        return mSourceStatistics[sourceIndex].mPenetrationParticleEnergySum;
-    }
-    auto GetPenetrationParticleEnergySumsSq(int sourceIndex) const -> const std::map<std::string, double>& {
-        return mSourceStatistics[sourceIndex].mPenetrationParticleEnergySumSq;
-    }
-    auto GetBackscatteringParticleCounts(int sourceIndex) const -> const std::map<std::string, double>& {
-        return mSourceStatistics[sourceIndex].mBackscatteringParticleCount;
-    }
-    auto GetBackscatteringParticleEnergySums(int sourceIndex) const -> const std::map<std::string, double>& {
-        return mSourceStatistics[sourceIndex].mBackscatteringParticleEnergySum;
-    }
-    auto GetBackscatteringParticleEnergySumsSq(int sourceIndex) const -> const std::map<std::string, double>& {
-        return mSourceStatistics[sourceIndex].mBackscatteringParticleEnergySumSq;
-    }
 
 private:
-    struct SourceStatistics {
-        explicit SourceStatistics(int layerCount) :
-            mLayerDepositionEnergySums(layerCount, 0.0),
-            mLayerDepositionEnergySumsSq(layerCount, 0.0) {}
-        long long mEventCount{0};
-        double mPenetrationEnergySum{0.0};
-        double mPenetrationEnergySumSq{0.0};
-        double mDepositionEnergySum{0.0};
-        double mDepositionEnergySumSq{0.0};
-        std::vector<double> mLayerDepositionEnergySums;
-        std::vector<double> mLayerDepositionEnergySumsSq;
-        double mBackscatteringEnergySum{0.0};
-        double mBackscatteringEnergySumSq{0.0};
-        std::map<std::string, double> mPenetrationParticleCount;
-        std::map<std::string, double> mPenetrationParticleEnergySum;
-        std::map<std::string, double> mPenetrationParticleEnergySumSq;
-        std::map<std::string, double> mBackscatteringParticleCount;
-        std::map<std::string, double> mBackscatteringParticleEnergySum;
-        std::map<std::string, double> mBackscatteringParticleEnergySumSq;
-    };
-
-    auto AddToMap(std::map<std::string, double>& target, const std::map<std::string, double>& source) -> void {
+    static auto AddToMap(std::map<std::string, double>& target, const std::map<std::string, double>& source) -> void {
         for (const auto& [key, value] : source) {
             target[key] += value;
         }
@@ -753,17 +736,17 @@ public:
         }
     }
 
-    auto AddEventResult(int sourceIndex, double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
-                        double backscatteringEnergy) -> void {
-        mCurrentRun->AddEventResult(sourceIndex, penetrationEnergy, layerDepositionEnergies, backscatteringEnergy);
+    auto AddEventResult(int sourceIndex, double penetratingEnergy, const std::vector<float>& layerDepositedEnergies,
+                        double backscatteredEnergy) -> void {
+        mCurrentRun->AddEventResult(sourceIndex, penetratingEnergy, layerDepositedEnergies, backscatteredEnergy);
     }
 
-    auto AddPenetrationEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
-        mCurrentRun->AddPenetrationEnergy(sourceIndex, particleName, energy);
+    auto AddPenetratingEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+        mCurrentRun->AddPenetratingEnergy(sourceIndex, particleName, energy);
     }
 
-    auto AddBackscatteringEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
-        mCurrentRun->AddBackscatteringEnergy(sourceIndex, particleName, energy);
+    auto AddBackscatteredEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+        mCurrentRun->AddBackscatteredEnergy(sourceIndex, particleName, energy);
     }
 
     auto GetFillContext(int sourceIndex) const -> std::shared_ptr<ROOT::RNTupleFillContext> {
@@ -795,45 +778,55 @@ private:
         }
         G4cout << '\n';
         G4cout << "===============================================================================\n";
-        auto printedAnySource{false};
+        // Effective incident energy of the compound source (intensity-weighted mean of the
+        // per-source energies), used to normalize the aggregated total ratios.
+        auto effectiveIncidentEnergy{0.0};
+        for (const auto& source : mConfig.mSources) {
+            effectiveIncidentEnergy += source.mWeight * source.mEnergy;
+        }
+        PrintSourceBlock("total: " + std::to_string(eventCount) + " events",
+                         run.GetTotalStatistics(), effectiveIncidentEnergy);
         for (auto sourceIndex{0}; sourceIndex < run.GetSourceCount(); ++sourceIndex) {
             const auto& source = mConfig.mSources[sourceIndex];
-            const auto sourceEventCount = run.GetEventCount(sourceIndex);
-            if (sourceEventCount < 1) {
+            const auto& statistics = run.GetStatistics(sourceIndex);
+            if (statistics.mEventCount < 1) {
                 continue;
             }
-            if (printedAnySource) {
-                // Separator between consecutive sources.
-                G4cout << "-------------------------------------------------------------------------------\n";
-            }
-            printedAnySource = true;
-            G4cout << " source " << sourceIndex << ": " << source.mParticleName << ' '
+            G4cout << "-------------------------------------------------------------------------------\n";
+            auto header = std::ostringstream{};
+            header << "source " << sourceIndex << ": " << source.mParticleName << ' '
                    << G4BestUnit(source.mEnergy, "Energy") << ", intensity "
                    << std::fixed << std::setprecision(4) << source.mWeight << ", "
-                   << sourceEventCount << " events:\n";
-            G4cout << std::defaultfloat << std::setprecision(6);
-            PrintEnergyRatio("penetration ratio (pen)", run.GetPenetrationEnergySum(sourceIndex),
-                             run.GetPenetrationEnergySumSq(sourceIndex), sourceEventCount, source.mEnergy);
-            PrintEnergyRatio("deposition ratio (dep)", run.GetDepositionEnergySum(sourceIndex),
-                             run.GetDepositionEnergySumSq(sourceIndex), sourceEventCount, source.mEnergy);
-            for (auto layerIndex{0}; layerIndex < run.GetLayerCount(); ++layerIndex) {
-                const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
-                                   mConfig.mLayers[layerIndex].mMaterialName + ')';
-                PrintEnergyRatio(label, run.GetLayerDepositionEnergySum(sourceIndex, layerIndex),
-                                 run.GetLayerDepositionEnergySumSq(sourceIndex, layerIndex), sourceEventCount,
-                                 source.mEnergy);
-            }
-            PrintEnergyRatio("back-scattering ratio (bsc)", run.GetBackscatteringEnergySum(sourceIndex),
-                             run.GetBackscatteringEnergySumSq(sourceIndex), sourceEventCount, source.mEnergy);
-            PrintParticleStatistics("penetration particles", run.GetPenetrationParticleCounts(sourceIndex),
-                                    run.GetPenetrationParticleEnergySums(sourceIndex),
-                                    run.GetPenetrationParticleEnergySumsSq(sourceIndex));
-            PrintParticleStatistics("back-scattering particles", run.GetBackscatteringParticleCounts(sourceIndex),
-                                    run.GetBackscatteringParticleEnergySums(sourceIndex),
-                                    run.GetBackscatteringParticleEnergySumsSq(sourceIndex));
+                   << statistics.mEventCount << " events";
+            PrintSourceBlock(header.str(), statistics, source.mEnergy);
         }
         G4cout << "===============================================================================\n"
                << G4endl;
+    }
+
+    auto PrintSourceBlock(const std::string& header, const SimulationRun::SourceStatistics& statistics,
+                          double incidentEnergy) -> void {
+        G4cout << ' ' << header << ":\n";
+        G4cout << std::defaultfloat << std::setprecision(6);
+        PrintEnergyRatio("penetrating energy ratio", statistics.mPenetratingEnergySum,
+                         statistics.mPenetratingEnergySumSq, statistics.mEventCount, incidentEnergy);
+        PrintEnergyRatio("deposited energy ratio", statistics.mDepositedEnergySum,
+                         statistics.mDepositedEnergySumSq, statistics.mEventCount, incidentEnergy);
+        for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
+            const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
+                               mConfig.mLayers[layerIndex].mMaterialName + ')';
+            PrintEnergyRatio(label, statistics.mLayerDepositedEnergySums[layerIndex],
+                             statistics.mLayerDepositedEnergySumsSq[layerIndex], statistics.mEventCount,
+                             incidentEnergy);
+        }
+        PrintEnergyRatio("back-scattered energy ratio", statistics.mBackscatteredEnergySum,
+                         statistics.mBackscatteredEnergySumSq, statistics.mEventCount, incidentEnergy);
+        PrintParticleStatistics("penetrating particles", statistics.mPenetratingParticleCount,
+                                statistics.mPenetratingParticleEnergySum,
+                                statistics.mPenetratingParticleEnergySumSq);
+        PrintParticleStatistics("back-scattered particles", statistics.mBackscatteredParticleCount,
+                                statistics.mBackscatteredParticleEnergySum,
+                                statistics.mBackscatteredParticleEnergySumSq);
     }
 
     auto PrintParticleStatistics(const std::string& title, const std::map<std::string, double>& particleCounts,
@@ -862,7 +855,7 @@ private:
         }
     }
 
-    auto PrintEnergyRatio(const std::string& label, double sumEnergy, double sumEnergySq, G4int eventCount,
+    auto PrintEnergyRatio(const std::string& label, double sumEnergy, double sumEnergySq, long long eventCount,
                           double incidentEnergy) -> void {
         const auto meanEnergy{sumEnergy / eventCount};
         const auto ratio{meanEnergy / incidentEnergy};
@@ -891,12 +884,12 @@ public:
         mFillStatuses(sourceCount),
         mFields(sourceCount),
         mLayerEnergyDeposit(layerCount, 0.0F),
-        mDepositionParticles(layerCount),
-        mDepositionX(layerCount),
-        mDepositionY(layerCount),
-        mDepositionZ(layerCount),
-        mDepositionWeight(layerCount),
-        mDepositionProcess(layerCount) {}
+        mDepositedParticles(layerCount),
+        mDepositedX(layerCount),
+        mDepositedY(layerCount),
+        mDepositedZ(layerCount),
+        mDepositedWeight(layerCount),
+        mDepositedProcess(layerCount) {}
     ~EventAction() override = default;
 
     auto SetSourceIndex(int sourceIndex) -> void {
@@ -918,38 +911,38 @@ public:
                 BindFields(*mEntries[sourceIndex], mFields[sourceIndex]);
             }
         }
-        mTotalPenetrationEnergy = 0.0F;
-        mPenetrationParticles.clear();
-        mPenetrationTheta.clear();
-        mPenetrationPhi.clear();
-        mPenetrationEnergy.clear();
-        mTotalDepositionEnergy = 0.0F;
+        mTotalPenetratingEnergy = 0.0F;
+        mPenetratingParticles.clear();
+        mPenetratingTheta.clear();
+        mPenetratingPhi.clear();
+        mPenetratingEnergy.clear();
+        mTotalDepositedEnergy = 0.0F;
         for (auto& layerEnergyDeposit : mLayerEnergyDeposit) {
             layerEnergyDeposit = 0.0F;
         }
-        for (auto& depositionParticles : mDepositionParticles) {
-            depositionParticles.clear();
+        for (auto& depositedParticles : mDepositedParticles) {
+            depositedParticles.clear();
         }
-        for (auto& depositionX : mDepositionX) {
-            depositionX.clear();
+        for (auto& depositedX : mDepositedX) {
+            depositedX.clear();
         }
-        for (auto& depositionY : mDepositionY) {
-            depositionY.clear();
+        for (auto& depositedY : mDepositedY) {
+            depositedY.clear();
         }
-        for (auto& depositionZ : mDepositionZ) {
-            depositionZ.clear();
+        for (auto& depositedZ : mDepositedZ) {
+            depositedZ.clear();
         }
-        for (auto& depositionWeight : mDepositionWeight) {
-            depositionWeight.clear();
+        for (auto& depositedWeight : mDepositedWeight) {
+            depositedWeight.clear();
         }
-        for (auto& depositionProcess : mDepositionProcess) {
-            depositionProcess.clear();
+        for (auto& depositedProcess : mDepositedProcess) {
+            depositedProcess.clear();
         }
-        mTotalBackscatteringEnergy = 0.0F;
-        mBackscatteringParticles.clear();
-        mBackscatteringTheta.clear();
-        mBackscatteringPhi.clear();
-        mBackscatteringEnergy.clear();
+        mTotalBackscatteredEnergy = 0.0F;
+        mBackscatteredParticles.clear();
+        mBackscatteredTheta.clear();
+        mBackscatteredPhi.clear();
+        mBackscatteredEnergy.clear();
     }
 
     auto EndOfEventAction(const G4Event* event) -> void override {
@@ -957,26 +950,26 @@ public:
             const auto sourceIndex = mCurrentSourceIndex;
             auto& fields = mFields[sourceIndex];
             *fields.mEventId = event->GetEventID();
-            *fields.mTotalPenetrationEnergy = mTotalPenetrationEnergy;
-            *fields.mPenetrationParticles = mPenetrationParticles;
-            *fields.mPenetrationTheta = mPenetrationTheta;
-            *fields.mPenetrationPhi = mPenetrationPhi;
-            *fields.mPenetrationEnergy = mPenetrationEnergy;
-            *fields.mTotalDepositionEnergy = mTotalDepositionEnergy;
+            *fields.mTotalPenetratingEnergy = mTotalPenetratingEnergy;
+            *fields.mPenetratingParticles = mPenetratingParticles;
+            *fields.mPenetratingTheta = mPenetratingTheta;
+            *fields.mPenetratingPhi = mPenetratingPhi;
+            *fields.mPenetratingEnergy = mPenetratingEnergy;
+            *fields.mTotalDepositedEnergy = mTotalDepositedEnergy;
             for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
                 *fields.mLayerEnergyDeposit[layerIndex] = mLayerEnergyDeposit[layerIndex];
-                *fields.mDepositionParticles[layerIndex] = mDepositionParticles[layerIndex];
-                *fields.mDepositionX[layerIndex] = mDepositionX[layerIndex];
-                *fields.mDepositionY[layerIndex] = mDepositionY[layerIndex];
-                *fields.mDepositionZ[layerIndex] = mDepositionZ[layerIndex];
-                *fields.mDepositionWeight[layerIndex] = mDepositionWeight[layerIndex];
-                *fields.mDepositionProcess[layerIndex] = mDepositionProcess[layerIndex];
+                *fields.mDepositedParticles[layerIndex] = mDepositedParticles[layerIndex];
+                *fields.mDepositedX[layerIndex] = mDepositedX[layerIndex];
+                *fields.mDepositedY[layerIndex] = mDepositedY[layerIndex];
+                *fields.mDepositedZ[layerIndex] = mDepositedZ[layerIndex];
+                *fields.mDepositedWeight[layerIndex] = mDepositedWeight[layerIndex];
+                *fields.mDepositedProcess[layerIndex] = mDepositedProcess[layerIndex];
             }
-            *fields.mTotalBackscatteringEnergy = mTotalBackscatteringEnergy;
-            *fields.mBackscatteringParticles = mBackscatteringParticles;
-            *fields.mBackscatteringTheta = mBackscatteringTheta;
-            *fields.mBackscatteringPhi = mBackscatteringPhi;
-            *fields.mBackscatteringEnergy = mBackscatteringEnergy;
+            *fields.mTotalBackscatteredEnergy = mTotalBackscatteredEnergy;
+            *fields.mBackscatteredParticles = mBackscatteredParticles;
+            *fields.mBackscatteredTheta = mBackscatteredTheta;
+            *fields.mBackscatteredPhi = mBackscatteredPhi;
+            *fields.mBackscatteredEnergy = mBackscatteredEnergy;
             // Fill the entry into the RNTuple of the source category drawn for this event. Filling only
             // buffers data in memory; the actual file write happens in the explicit FlushCluster call,
             // which is serialized across all parallel writers through the file-access mutex.
@@ -991,87 +984,87 @@ public:
                 }
             }
         }
-        mRunAction.AddEventResult(mCurrentSourceIndex, mTotalPenetrationEnergy, mLayerEnergyDeposit,
-                                  mTotalBackscatteringEnergy);
+        mRunAction.AddEventResult(mCurrentSourceIndex, mTotalPenetratingEnergy, mLayerEnergyDeposit,
+                                  mTotalBackscatteredEnergy);
     }
 
-    auto AddPenetration(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
-        AddExitPoint(mPenetrationParticles, mPenetrationTheta, mPenetrationPhi, mPenetrationEnergy,
-                     mTotalPenetrationEnergy, particleName, direction, energy);
-        mRunAction.AddPenetrationEnergy(mCurrentSourceIndex, particleName, energy);
+    auto AddPenetratingParticle(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
+        AddExitPoint(mPenetratingParticles, mPenetratingTheta, mPenetratingPhi, mPenetratingEnergy,
+                     mTotalPenetratingEnergy, particleName, direction, energy);
+        mRunAction.AddPenetratingEnergy(mCurrentSourceIndex, particleName, energy);
     }
 
-    auto AddDeposition(int layerIndex, const std::string& particleName, const G4ThreeVector& position,
+    auto AddDepositedEnergy(int layerIndex, const std::string& particleName, const G4ThreeVector& position,
                        float energyDeposit, const std::string& processName) -> void {
-        mTotalDepositionEnergy += energyDeposit;
+        mTotalDepositedEnergy += energyDeposit;
         mLayerEnergyDeposit[layerIndex] += energyDeposit;
-        mDepositionParticles[layerIndex].push_back(particleName);
-        mDepositionX[layerIndex].push_back(static_cast<float>(position.x()));
-        mDepositionY[layerIndex].push_back(static_cast<float>(position.y()));
-        mDepositionZ[layerIndex].push_back(static_cast<float>(position.z()));
-        mDepositionWeight[layerIndex].push_back(energyDeposit);
-        mDepositionProcess[layerIndex].push_back(processName);
+        mDepositedParticles[layerIndex].push_back(particleName);
+        mDepositedX[layerIndex].push_back(static_cast<float>(position.x()));
+        mDepositedY[layerIndex].push_back(static_cast<float>(position.y()));
+        mDepositedZ[layerIndex].push_back(static_cast<float>(position.z()));
+        mDepositedWeight[layerIndex].push_back(energyDeposit);
+        mDepositedProcess[layerIndex].push_back(processName);
     }
 
-    auto AddBackscattering(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
-        AddExitPoint(mBackscatteringParticles, mBackscatteringTheta, mBackscatteringPhi, mBackscatteringEnergy,
-                     mTotalBackscatteringEnergy, particleName, direction, energy);
-        mRunAction.AddBackscatteringEnergy(mCurrentSourceIndex, particleName, energy);
+    auto AddBackscatteredParticle(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
+        AddExitPoint(mBackscatteredParticles, mBackscatteredTheta, mBackscatteredPhi, mBackscatteredEnergy,
+                     mTotalBackscatteredEnergy, particleName, direction, energy);
+        mRunAction.AddBackscatteredEnergy(mCurrentSourceIndex, particleName, energy);
     }
 
 private:
     struct SourceFields {
         std::shared_ptr<int> mEventId;
-        std::shared_ptr<float> mTotalPenetrationEnergy;
-        std::shared_ptr<std::vector<std::string>> mPenetrationParticles;
-        std::shared_ptr<std::vector<float>> mPenetrationTheta;
-        std::shared_ptr<std::vector<float>> mPenetrationPhi;
-        std::shared_ptr<std::vector<float>> mPenetrationEnergy;
-        std::shared_ptr<float> mTotalDepositionEnergy;
+        std::shared_ptr<float> mTotalPenetratingEnergy;
+        std::shared_ptr<std::vector<std::string>> mPenetratingParticles;
+        std::shared_ptr<std::vector<float>> mPenetratingTheta;
+        std::shared_ptr<std::vector<float>> mPenetratingPhi;
+        std::shared_ptr<std::vector<float>> mPenetratingEnergy;
+        std::shared_ptr<float> mTotalDepositedEnergy;
         std::vector<std::shared_ptr<float>> mLayerEnergyDeposit;
-        std::vector<std::shared_ptr<std::vector<std::string>>> mDepositionParticles;
-        std::vector<std::shared_ptr<std::vector<float>>> mDepositionX;
-        std::vector<std::shared_ptr<std::vector<float>>> mDepositionY;
-        std::vector<std::shared_ptr<std::vector<float>>> mDepositionZ;
-        std::vector<std::shared_ptr<std::vector<float>>> mDepositionWeight;
-        std::vector<std::shared_ptr<std::vector<std::string>>> mDepositionProcess;
-        std::shared_ptr<float> mTotalBackscatteringEnergy;
-        std::shared_ptr<std::vector<std::string>> mBackscatteringParticles;
-        std::shared_ptr<std::vector<float>> mBackscatteringTheta;
-        std::shared_ptr<std::vector<float>> mBackscatteringPhi;
-        std::shared_ptr<std::vector<float>> mBackscatteringEnergy;
+        std::vector<std::shared_ptr<std::vector<std::string>>> mDepositedParticles;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositedX;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositedY;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositedZ;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositedWeight;
+        std::vector<std::shared_ptr<std::vector<std::string>>> mDepositedProcess;
+        std::shared_ptr<float> mTotalBackscatteredEnergy;
+        std::shared_ptr<std::vector<std::string>> mBackscatteredParticles;
+        std::shared_ptr<std::vector<float>> mBackscatteredTheta;
+        std::shared_ptr<std::vector<float>> mBackscatteredPhi;
+        std::shared_ptr<std::vector<float>> mBackscatteredEnergy;
     };
 
     auto BindFields(ROOT::REntry& entry, SourceFields& fields) -> void {
         fields.mEventId = entry.GetPtr<int>("event_id");
-        fields.mTotalPenetrationEnergy = entry.GetPtr<float>("total_e_pen");
-        fields.mPenetrationParticles = entry.GetPtr<std::vector<std::string>>("particle_pen");
-        fields.mPenetrationTheta = entry.GetPtr<std::vector<float>>("theta_pen");
-        fields.mPenetrationPhi = entry.GetPtr<std::vector<float>>("phi_pen");
-        fields.mPenetrationEnergy = entry.GetPtr<std::vector<float>>("e_pen");
-        fields.mTotalDepositionEnergy = entry.GetPtr<float>("total_e_dep");
+        fields.mTotalPenetratingEnergy = entry.GetPtr<float>("total_e_pen");
+        fields.mPenetratingParticles = entry.GetPtr<std::vector<std::string>>("particle_pen");
+        fields.mPenetratingTheta = entry.GetPtr<std::vector<float>>("theta_pen");
+        fields.mPenetratingPhi = entry.GetPtr<std::vector<float>>("phi_pen");
+        fields.mPenetratingEnergy = entry.GetPtr<std::vector<float>>("e_pen");
+        fields.mTotalDepositedEnergy = entry.GetPtr<float>("total_e_dep");
         fields.mLayerEnergyDeposit.clear();
-        fields.mDepositionParticles.clear();
-        fields.mDepositionX.clear();
-        fields.mDepositionY.clear();
-        fields.mDepositionZ.clear();
-        fields.mDepositionWeight.clear();
-        fields.mDepositionProcess.clear();
+        fields.mDepositedParticles.clear();
+        fields.mDepositedX.clear();
+        fields.mDepositedY.clear();
+        fields.mDepositedZ.clear();
+        fields.mDepositedWeight.clear();
+        fields.mDepositedProcess.clear();
         for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
             const auto suffix = std::to_string(layerIndex);
             fields.mLayerEnergyDeposit.push_back(entry.GetPtr<float>("e_dep_" + suffix));
-            fields.mDepositionParticles.push_back(entry.GetPtr<std::vector<std::string>>("particle_dep_" + suffix));
-            fields.mDepositionX.push_back(entry.GetPtr<std::vector<float>>("x_dep_" + suffix));
-            fields.mDepositionY.push_back(entry.GetPtr<std::vector<float>>("y_dep_" + suffix));
-            fields.mDepositionZ.push_back(entry.GetPtr<std::vector<float>>("z_dep_" + suffix));
-            fields.mDepositionWeight.push_back(entry.GetPtr<std::vector<float>>("w_dep_" + suffix));
-            fields.mDepositionProcess.push_back(entry.GetPtr<std::vector<std::string>>("proc_dep_" + suffix));
+            fields.mDepositedParticles.push_back(entry.GetPtr<std::vector<std::string>>("particle_dep_" + suffix));
+            fields.mDepositedX.push_back(entry.GetPtr<std::vector<float>>("x_dep_" + suffix));
+            fields.mDepositedY.push_back(entry.GetPtr<std::vector<float>>("y_dep_" + suffix));
+            fields.mDepositedZ.push_back(entry.GetPtr<std::vector<float>>("z_dep_" + suffix));
+            fields.mDepositedWeight.push_back(entry.GetPtr<std::vector<float>>("w_dep_" + suffix));
+            fields.mDepositedProcess.push_back(entry.GetPtr<std::vector<std::string>>("proc_dep_" + suffix));
         }
-        fields.mTotalBackscatteringEnergy = entry.GetPtr<float>("total_e_bsc");
-        fields.mBackscatteringParticles = entry.GetPtr<std::vector<std::string>>("particle_bsc");
-        fields.mBackscatteringTheta = entry.GetPtr<std::vector<float>>("theta_bsc");
-        fields.mBackscatteringPhi = entry.GetPtr<std::vector<float>>("phi_bsc");
-        fields.mBackscatteringEnergy = entry.GetPtr<std::vector<float>>("e_bsc");
+        fields.mTotalBackscatteredEnergy = entry.GetPtr<float>("total_e_bsc");
+        fields.mBackscatteredParticles = entry.GetPtr<std::vector<std::string>>("particle_bsc");
+        fields.mBackscatteredTheta = entry.GetPtr<std::vector<float>>("theta_bsc");
+        fields.mBackscatteredPhi = entry.GetPtr<std::vector<float>>("phi_bsc");
+        fields.mBackscatteredEnergy = entry.GetPtr<std::vector<float>>("e_bsc");
     }
 
     auto AddExitPoint(std::vector<std::string>& particleNames, std::vector<float>& thetas, std::vector<float>& phis,
@@ -1095,24 +1088,24 @@ private:
     std::vector<std::unique_ptr<ROOT::REntry>> mEntries;
     std::vector<ROOT::RNTupleFillStatus> mFillStatuses;
     std::vector<SourceFields> mFields;
-    float mTotalPenetrationEnergy{0.0F};
-    std::vector<std::string> mPenetrationParticles;
-    std::vector<float> mPenetrationTheta;
-    std::vector<float> mPenetrationPhi;
-    std::vector<float> mPenetrationEnergy;
-    float mTotalDepositionEnergy{0.0F};
+    float mTotalPenetratingEnergy{0.0F};
+    std::vector<std::string> mPenetratingParticles;
+    std::vector<float> mPenetratingTheta;
+    std::vector<float> mPenetratingPhi;
+    std::vector<float> mPenetratingEnergy;
+    float mTotalDepositedEnergy{0.0F};
     std::vector<float> mLayerEnergyDeposit;
-    std::vector<std::vector<std::string>> mDepositionParticles;
-    std::vector<std::vector<float>> mDepositionX;
-    std::vector<std::vector<float>> mDepositionY;
-    std::vector<std::vector<float>> mDepositionZ;
-    std::vector<std::vector<float>> mDepositionWeight;
-    std::vector<std::vector<std::string>> mDepositionProcess;
-    float mTotalBackscatteringEnergy{0.0F};
-    std::vector<std::string> mBackscatteringParticles;
-    std::vector<float> mBackscatteringTheta;
-    std::vector<float> mBackscatteringPhi;
-    std::vector<float> mBackscatteringEnergy;
+    std::vector<std::vector<std::string>> mDepositedParticles;
+    std::vector<std::vector<float>> mDepositedX;
+    std::vector<std::vector<float>> mDepositedY;
+    std::vector<std::vector<float>> mDepositedZ;
+    std::vector<std::vector<float>> mDepositedWeight;
+    std::vector<std::vector<std::string>> mDepositedProcess;
+    float mTotalBackscatteredEnergy{0.0F};
+    std::vector<std::string> mBackscatteredParticles;
+    std::vector<float> mBackscatteredTheta;
+    std::vector<float> mBackscatteredPhi;
+    std::vector<float> mBackscatteredEnergy;
 };
 
 class SteppingAction : public G4UserSteppingAction {
@@ -1139,7 +1132,7 @@ public:
         }
         const auto process = step->GetPostStepPoint()->GetProcessDefinedStep();
         const auto processName = process != nullptr ? process->GetProcessName() : "<null>";
-        mEventAction.AddDeposition(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
+        mEventAction.AddDepositedEnergy(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
                                    step->GetPostStepPoint()->GetPosition(), static_cast<float>(energyDeposit), processName);
     }
 
@@ -1168,9 +1161,9 @@ public:
         const auto energy = static_cast<float>(track->GetKineticEnergy());
         const auto particleName = definition->GetParticleName();
         if (direction.z() >= 0.0) {
-            mEventAction.AddPenetration(particleName, direction, energy);
+            mEventAction.AddPenetratingParticle(particleName, direction, energy);
         } else {
-            mEventAction.AddBackscattering(particleName, direction, energy);
+            mEventAction.AddBackscatteredParticle(particleName, direction, energy);
         }
     }
 
