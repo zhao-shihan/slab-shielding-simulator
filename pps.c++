@@ -69,8 +69,28 @@ auto DefaultThreadCount() -> int {
     return coreCount > 0 ? static_cast<int>(coreCount) : 1;
 }
 
+enum struct MaterialCompositionType {
+    nist,
+    atoms,
+    massFractions,
+    materials
+};
+
+struct MaterialComponent {
+    std::string mName;
+    double mQuantity{1.0};
+    bool mQuantitySpecified{false};
+};
+
+struct LayerMaterial {
+    std::string mName;
+    MaterialCompositionType mKind{MaterialCompositionType::nist};
+    std::vector<MaterialComponent> mComponents;
+    double mDensity{0.0};
+};
+
 struct Layer {
-    std::string mMaterialName;
+    LayerMaterial mMaterial;
     double mThickness{0.0};
 };
 
@@ -164,6 +184,139 @@ auto Trim(const std::string& text) -> std::string {
     return text.substr(first, last - first + 1);
 }
 
+auto ParseDensity(const std::string& text) -> double {
+    auto stream = std::istringstream{text};
+    auto value{0.0};
+    auto suffix = std::string{};
+    stream >> value;
+    if (stream.fail()) {
+        throw std::invalid_argument("cannot parse numeric value from '" + text + "'");
+    }
+    stream >> suffix;
+    // A bare number is interpreted in g/cm3, the conventional density unit.
+    auto unit = g / cm3;
+    if (suffix == "g/cm3" or suffix == "g/mL" or suffix == "g/ml") {
+        unit = g / cm3;
+    } else if (suffix == "kg/m3" or suffix == "kg/m^3") {
+        unit = kg / m3;
+    } else if (not suffix.empty()) {
+        throw std::invalid_argument("unknown unit '" + suffix + "' in density '" + text + "'");
+    }
+    const auto density = value * unit;
+    if (not std::isfinite(density) or density <= 0.0) {
+        throw std::invalid_argument("invalid density '" + text + "'");
+    }
+    return density;
+}
+
+auto ParseMaterialComponents(const std::string& text) -> std::vector<MaterialComponent> {
+    auto components = std::vector<MaterialComponent>{};
+    auto stream = std::istringstream{text};
+    auto componentSpec = std::string{};
+    while (std::getline(stream, componentSpec, ',')) {
+        if (componentSpec.empty()) {
+            throw std::invalid_argument("empty component in material composition '" + text + "'");
+        }
+        auto component = MaterialComponent{};
+        const auto colon = componentSpec.find(':');
+        if (colon == std::string::npos) {
+            component.mName = Trim(componentSpec);
+        } else {
+            component.mName = Trim(componentSpec.substr(0, colon));
+            const auto quantityText = Trim(componentSpec.substr(colon + 1));
+            auto parseIndex = std::size_t{0};
+            try {
+                component.mQuantity = std::stod(quantityText, &parseIndex);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("cannot parse quantity '" + quantityText + "' in component '" + componentSpec + "'");
+            }
+            if (parseIndex != quantityText.size()) {
+                throw std::invalid_argument("cannot parse quantity '" + quantityText + "' in component '" + componentSpec + "'");
+            }
+            component.mQuantitySpecified = true;
+        }
+        if (component.mName.empty()) {
+            throw std::invalid_argument("empty component name in material composition '" + text + "'");
+        }
+        if (not std::isfinite(component.mQuantity) or component.mQuantity <= 0.0) {
+            throw std::invalid_argument("component '" + componentSpec + "' has a non-positive quantity");
+        }
+        components.push_back(std::move(component));
+    }
+    if (components.empty()) {
+        throw std::invalid_argument("material composition '" + text + "' is empty");
+    }
+    if (components.size() > 1) {
+        for (const auto& component : components) {
+            if (not component.mQuantitySpecified) {
+                throw std::invalid_argument(
+                    "component '" + component.mName + "' is missing its quantity; the quantity may be "
+                                                      "omitted only when the composition has a single component");
+            }
+        }
+    }
+    return components;
+}
+
+auto ParseLayerSpec(const std::string& layerSpec) -> Layer {
+    const auto firstColon = layerSpec.find(':');
+    if (firstColon == std::string::npos) {
+        throw std::invalid_argument(
+            "layer '" + layerSpec + "' must be a NIST material 'name:thickness' or a custom material "
+                                    "'name:[...|...|<...>]:density:thickness'");
+    }
+    auto layer = Layer{};
+    layer.mMaterial.mName = Trim(layerSpec.substr(0, firstColon));
+    if (layer.mMaterial.mName.empty()) {
+        throw std::invalid_argument("layer '" + layerSpec + "' has an empty material name");
+    }
+    auto remainder = layerSpec.substr(firstColon + 1);
+    const auto opening = remainder.empty() ? '\0' : remainder.front();
+    if (opening == '[' or opening == '{' or opening == '<') {
+        const auto closing = opening == '[' ? ']' : opening == '{' ? '}' :
+                                                                     '>';
+        const auto closingPos = remainder.find(closing);
+        if (closingPos == std::string::npos) {
+            throw std::invalid_argument("layer '" + layerSpec + "' has an unterminated composition list");
+        }
+        const auto compositionSpec = Trim(remainder.substr(1, closingPos - 1));
+        remainder = remainder.substr(closingPos + 1);
+        // The remainder has the form ':density:thickness'.
+        if (remainder.empty() or remainder.front() != ':') {
+            throw std::invalid_argument("layer '" + layerSpec + "' is missing its density or thickness");
+        }
+        const auto densityColon = remainder.find(':', 1);
+        if (densityColon == std::string::npos) {
+            throw std::invalid_argument("layer '" + layerSpec + "' is missing its density or thickness");
+        }
+        if (opening == '[') {
+            layer.mMaterial.mKind = MaterialCompositionType::atoms;
+        } else if (opening == '{') {
+            layer.mMaterial.mKind = MaterialCompositionType::massFractions;
+        } else {
+            layer.mMaterial.mKind = MaterialCompositionType::materials;
+        }
+        layer.mMaterial.mComponents = ParseMaterialComponents(compositionSpec);
+        if (layer.mMaterial.mKind == MaterialCompositionType::atoms) {
+            for (const auto& component : layer.mMaterial.mComponents) {
+                if (component.mQuantity != std::floor(component.mQuantity)) {
+                    throw std::invalid_argument(
+                        "component '" + component.mName + "' in layer '" + layerSpec + "' has a non-integer atom count");
+                }
+            }
+        }
+        layer.mMaterial.mDensity = ParseDensity(Trim(remainder.substr(1, densityColon - 1)));
+        layer.mThickness = ParseLength(Trim(remainder.substr(densityColon + 1)));
+    } else {
+        layer.mMaterial.mKind = MaterialCompositionType::nist;
+        layer.mThickness = ParseLength(Trim(remainder));
+    }
+    if (layer.mThickness <= 0.0) {
+        throw std::invalid_argument("layer '" + layerSpec + "' has a non-positive thickness");
+    }
+    return layer;
+}
+
 auto ParseLayers(const std::string& text) -> std::vector<Layer> {
     auto layers = std::vector<Layer>{};
     auto stream = std::istringstream{text};
@@ -172,21 +325,7 @@ auto ParseLayers(const std::string& text) -> std::vector<Layer> {
         if (layerSpec.empty()) {
             throw std::invalid_argument("empty layer specification in '" + text + "'");
         }
-        const auto colon = layerSpec.find(':');
-        if (colon == std::string::npos) {
-            throw std::invalid_argument(
-                "layer '" + layerSpec + "' must have the form 'material:thickness', e.g. G4_Cu:10 cm");
-        }
-        auto layer = Layer{};
-        layer.mMaterialName = Trim(layerSpec.substr(0, colon));
-        layer.mThickness = ParseLength(Trim(layerSpec.substr(colon + 1)));
-        if (layer.mMaterialName.empty()) {
-            throw std::invalid_argument("layer '" + layerSpec + "' has an empty material name");
-        }
-        if (layer.mThickness <= 0.0) {
-            throw std::invalid_argument("layer '" + layerSpec + "' has a non-positive thickness");
-        }
-        layers.push_back(std::move(layer));
+        layers.push_back(ParseLayerSpec(layerSpec));
     }
     if (layers.empty()) {
         throw std::invalid_argument("at least one material layer is required");
@@ -278,12 +417,21 @@ auto PrintUsage(const char* programName) -> void {
         << "'run{runId}_src{typeId}' inside a ROOT file, otherwise no ROOT file is produced\n"
         << "\n"
         << "required options:\n"
-        << "  -m, --material <spec>    material layers as semicolon-separated 'name:thickness' entries, built in\n"
-        << "                           order from the source, e.g. \"G4_WATER:10 cm;G4_Cu:5 cm\"\n"
+        << "  -m, --material <spec>    material layers as semicolon-separated entries, built in order from the\n"
+        << "                           source; a layer is a NIST material 'name:thickness' or a custom material\n"
+        << "                           'name:<composition>:density:thickness' with one of:\n"
+        << "                             1. <composition> = [elem1:n1,elem2:n2,...]\n"
+        << "                              elements by atom counts, e.g. water:[H:2,O:1]:1g/cm3:1mm\n"
+        << "                             2. <composition> = {elem1:f1,elem2:f2,...}\n"
+        << "                              elements by mass fractions, e.g. air:{N:0.7,O:0.3}:1g/cm3:1\n"
+        << "                             3. <composition> = <mat1:f1,mat2:f2,...>\n"
+        << "                              predefined materials by mass fractions, wc:<G4_CONCRETE:0.95,G4_WATER:0.05>:2.3:10 mm\n"
+        << "                           a bare density number is in g/cm3; a single component may omit its atom count\n"
+        << "                           or mass fraction\n"
         << "  -s, --rad-src <spec>     compound radiation source as semicolon-separated 'particle:energy[:intensity]'\n"
         << "                           entries; the intensity is the relative intensity of the source and may be\n"
         << "                           omitted only when the list contains a single source, e.g.\n"
-        << "                           \"e+:10 MeV:15;gamma:3 MeV:12\" or \"neutron:1 MeV\"; intensities are\n"
+        << "                           'e+:10MeV:15;gamma:3MeV:12' or 'neutron:1MeV'; intensities are\n"
         << "                           normalized to probabilities and every event emits one primary whose source\n"
         << "                           type is drawn from the resulting multinomial distribution\n"
         << "\n"
@@ -384,9 +532,32 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
 }
 
 auto ValidateMaterials(const Config& config) -> void {
+    const auto nistManager = G4NistManager::Instance();
     for (const auto& layer : config.mLayers) {
-        if (G4NistManager::Instance()->FindOrBuildMaterial(layer.mMaterialName) == nullptr) {
-            throw std::invalid_argument("material '" + layer.mMaterialName + "' not found in the NIST material database");
+        switch (layer.mMaterial.mKind) {
+        case MaterialCompositionType::nist:
+            if (nistManager->FindOrBuildMaterial(layer.mMaterial.mName) == nullptr) {
+                throw std::invalid_argument(
+                    "material '" + layer.mMaterial.mName + "' not found in the NIST material database");
+            }
+            break;
+        case MaterialCompositionType::atoms:
+        case MaterialCompositionType::massFractions:
+            for (const auto& component : layer.mMaterial.mComponents) {
+                if (nistManager->FindOrBuildElement(component.mName) == nullptr) {
+                    throw std::invalid_argument(
+                        "element '" + component.mName + "' of material '" + layer.mMaterial.mName + "' not found");
+                }
+            }
+            break;
+        case MaterialCompositionType::materials:
+            for (const auto& component : layer.mMaterial.mComponents) {
+                if (nistManager->FindOrBuildMaterial(component.mName) == nullptr) {
+                    throw std::invalid_argument(
+                        "material '" + component.mName + "' of material '" + layer.mMaterial.mName + "' not found in the NIST material database");
+                }
+            }
+            break;
         }
     }
 }
@@ -542,7 +713,7 @@ public:
         for (const auto& layer : mConfig.mLayers) {
             const auto layerHalfLength = 0.5 * layer.mThickness;
             const auto solidLayer = new G4Box{"LayerSolid", xyHalfLength, xyHalfLength, layerHalfLength};
-            const auto layerMaterial = nistManager->FindOrBuildMaterial(layer.mMaterialName);
+            const auto layerMaterial = BuildMaterial(layer.mMaterial);
             const auto logicalLayer = new G4LogicalVolume{solidLayer, layerMaterial, "Layer"};
             new G4PVPlacement{
                 nullptr, G4ThreeVector{0.0, 0.0, zPosition + layerHalfLength},
@@ -562,8 +733,58 @@ public:
     }
 
 private:
+    // Resolve a NIST material or build a custom material. Custom materials are cached by their
+    // complete specification so that repeated layers reuse the same G4Material instead of creating
+    // duplicate table entries. Custom materials are constructed as solids at NTP; the material
+    // state is irrelevant for the transport processes used here.
+    auto BuildMaterial(const LayerMaterial& layerMaterial) -> G4Material* {
+        const auto nistManager = G4NistManager::Instance();
+        if (layerMaterial.mKind == MaterialCompositionType::nist) {
+            return nistManager->FindOrBuildMaterial(layerMaterial.mName);
+        }
+        auto key = std::ostringstream{};
+        key << layerMaterial.mName << '|' << static_cast<int>(layerMaterial.mKind) << '|' << layerMaterial.mDensity;
+        for (const auto& component : layerMaterial.mComponents) {
+            key << '|' << component.mName << ':' << component.mQuantity;
+        }
+        const auto cached = mCustomMaterials.find(key.str());
+        if (cached != mCustomMaterials.end()) {
+            return cached->second;
+        }
+        auto material = new G4Material{layerMaterial.mName, layerMaterial.mDensity,
+                                       static_cast<G4int>(layerMaterial.mComponents.size()), kStateSolid};
+        if (layerMaterial.mKind == MaterialCompositionType::atoms) {
+            for (const auto& component : layerMaterial.mComponents) {
+                auto element = nistManager->FindOrBuildElement(component.mName);
+                if (element == nullptr) {
+                    throw std::invalid_argument("element '" + component.mName + "' not found");
+                }
+                material->AddElementByNumberOfAtoms(element, static_cast<G4int>(component.mQuantity));
+            }
+        } else if (layerMaterial.mKind == MaterialCompositionType::massFractions) {
+            for (const auto& component : layerMaterial.mComponents) {
+                auto element = nistManager->FindOrBuildElement(component.mName);
+                if (element == nullptr) {
+                    throw std::invalid_argument("element '" + component.mName + "' not found");
+                }
+                material->AddElementByMassFraction(element, component.mQuantity);
+            }
+        } else {
+            for (const auto& component : layerMaterial.mComponents) {
+                auto baseMaterial = nistManager->FindOrBuildMaterial(component.mName);
+                if (baseMaterial == nullptr) {
+                    throw std::invalid_argument("material '" + component.mName + "' not found");
+                }
+                material->AddMaterial(baseMaterial, component.mQuantity);
+            }
+        }
+        mCustomMaterials.emplace(key.str(), material);
+        return material;
+    }
+
     const Config& mConfig;
     std::unordered_map<const G4LogicalVolume*, int> mMaterialVolumes;
+    std::unordered_map<std::string, G4Material*> mCustomMaterials;
 };
 
 class SimulationRun : public G4Run {
@@ -843,7 +1064,7 @@ private:
         }
         // Aggregated total block is printed last.
         G4cout << "-------------------------------------------------------------------------------\n";
-        PrintSourceBlock("total: " + std::to_string(eventCount) + " events",
+        PrintSourceBlock("total: " + std::to_string(mConfig.mSources.size()) + " components, " + std::to_string(eventCount) + " events",
                          run.GetTotalStatistics(), effectiveIncidentEnergy);
         G4cout << "===============================================================================\n"
                << G4endl;
@@ -859,7 +1080,7 @@ private:
                          statistics.mDepositedEnergySumSq, statistics.mEventCount, incidentEnergy);
         for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
             const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
-                               mConfig.mLayers[layerIndex].mMaterialName + ')';
+                               mConfig.mLayers[layerIndex].mMaterial.mName + ')';
             PrintEnergyRatio(label, statistics.mLayerDepositedEnergySums[layerIndex],
                              statistics.mLayerDepositedEnergySumsSq[layerIndex], statistics.mEventCount,
                              incidentEnergy);
@@ -878,7 +1099,7 @@ private:
         PrintPrimaryRatio("primary particle deposition ratio", totalDepositedPrimaryCount, statistics.mEventCount);
         for (auto layerIndex{0}; layerIndex < static_cast<int>(mConfig.mLayers.size()); ++layerIndex) {
             const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
-                               mConfig.mLayers[layerIndex].mMaterialName + ')';
+                               mConfig.mLayers[layerIndex].mMaterial.mName + ')';
             PrintPrimaryRatio(label, statistics.mLayerDepositedPrimaryCounts[layerIndex], statistics.mEventCount);
         }
         PrintPrimaryRatio("primary particle backscattering ratio", statistics.mBackscatteredPrimaryCount,
@@ -898,7 +1119,7 @@ private:
         const auto proportion{static_cast<double>(count) / eventCount};
         // Standard error of the binomial proportion.
         const auto proportionError{std::sqrt(proportion * (1.0 - proportion) / eventCount)};
-        G4cout << "   " << std::left << std::setw(45) << label << '(' << 100.0 * proportion << " +/- "
+        G4cout << "   " << std::left << std::setw(45) << label + ':' << '(' << 100.0 * proportion << " +/- "
                << 100.0 * proportionError << ") %" << G4endl;
     }
 
@@ -908,7 +1129,7 @@ private:
         if (particleCounts.empty()) {
             return;
         }
-        G4cout << "   " << title << '\n';
+        G4cout << "   " << title << ":\n";
         G4cout << "     "
                << std::setw(14) << "particle"
                << std::setw(20) << "<E>"
@@ -934,7 +1155,7 @@ private:
         const auto ratio{meanEnergy / incidentEnergy};
         const auto variance{(sumEnergySq - sumEnergy * sumEnergy / eventCount) / (eventCount - 1)};
         const auto ratioError{std::sqrt(variance / eventCount) / incidentEnergy};
-        G4cout << "   " << std::left << std::setw(45) << label << '(' << 100.0 * ratio << " +/- "
+        G4cout << "   " << std::left << std::setw(45) << label + ':' << '(' << 100.0 * ratio << " +/- "
                << 100.0 * ratioError << ") %" << G4endl;
     }
 
@@ -1219,7 +1440,7 @@ public:
         const auto process = step->GetPostStepPoint()->GetProcessDefinedStep();
         const auto processName = process != nullptr ? process->GetProcessName() : "<null>";
         mEventAction.AddDepositedEnergy(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
-                                   step->GetPostStepPoint()->GetPosition(), energyDeposit, processName);
+                                        step->GetPostStepPoint()->GetPosition(), energyDeposit, processName);
     }
 
 private:
