@@ -628,7 +628,7 @@ public:
         }
     }
 
-    auto AddEventResult(int sourceIndex, double penetratingEnergy, const std::vector<float>& layerDepositedEnergies,
+    auto AddEventResult(int sourceIndex, double penetratingEnergy, const std::vector<double>& layerDepositedEnergies,
                         double backscatteredEnergy) -> void {
         auto& statistics = mSourceStatistics[sourceIndex];
         ++statistics.mEventCount;
@@ -762,7 +762,7 @@ public:
         }
     }
 
-    auto AddEventResult(int sourceIndex, double penetratingEnergy, const std::vector<float>& layerDepositedEnergies,
+    auto AddEventResult(int sourceIndex, double penetratingEnergy, const std::vector<double>& layerDepositedEnergies,
                         double backscatteredEnergy) -> void {
         mCurrentRun->AddEventResult(sourceIndex, penetratingEnergy, layerDepositedEnergies, backscatteredEnergy);
     }
@@ -919,7 +919,7 @@ private:
             const auto energySumSq = energySumsSq.find(particleName)->second;
             const auto meanEnergy = energySum / count;
             const auto variance = energySumSq / count - meanEnergy * meanEnergy;
-            const auto rmsEnergy = variance > 0.0 ? std::sqrt(variance) : 0.0;
+            const auto rmsEnergy = std::sqrt(variance);
             G4cout << "     "
                    << std::setw(14) << particleName
                    << std::setw(20) << FormatEnergy(meanEnergy)
@@ -932,9 +932,7 @@ private:
                           double incidentEnergy) -> void {
         const auto meanEnergy{sumEnergy / eventCount};
         const auto ratio{meanEnergy / incidentEnergy};
-        // Clamp to non-negative: with eventCount < 2 or exact cancellation the sample variance is
-        // zero (or slightly negative from float rounding) and sqrt of a negative value would be NaN.
-        const auto variance{std::max(0.0, (sumEnergySq - sumEnergy * sumEnergy / eventCount) / (eventCount - 1))};
+        const auto variance{(sumEnergySq - sumEnergy * sumEnergy / eventCount) / (eventCount - 1)};
         const auto ratioError{std::sqrt(variance / eventCount) / incidentEnergy};
         G4cout << "   " << std::left << std::setw(45) << label << '(' << 100.0 * ratio << " +/- "
                << 100.0 * ratioError << ") %" << G4endl;
@@ -956,7 +954,7 @@ public:
         mEntries(sourceCount),
         mFillStatuses(sourceCount),
         mFields(sourceCount),
-        mLayerEnergyDeposit(layerCount, 0.0F),
+        mLayerEnergyDeposit(layerCount, 0.0),
         mDepositedParticles(layerCount),
         mDepositedX(layerCount),
         mDepositedY(layerCount),
@@ -984,14 +982,14 @@ public:
                 BindFields(*mEntries[sourceIndex], mFields[sourceIndex]);
             }
         }
-        mTotalPenetratingEnergy = 0.0F;
+        mTotalPenetratingEnergy = 0.0;
         mPenetratingParticles.clear();
         mPenetratingTheta.clear();
         mPenetratingPhi.clear();
         mPenetratingEnergy.clear();
-        mTotalDepositedEnergy = 0.0F;
+        mTotalDepositedEnergy = 0.0;
         for (auto& layerEnergyDeposit : mLayerEnergyDeposit) {
-            layerEnergyDeposit = 0.0F;
+            layerEnergyDeposit = 0.0;
         }
         for (auto& depositedParticles : mDepositedParticles) {
             depositedParticles.clear();
@@ -1011,7 +1009,7 @@ public:
         for (auto& depositedProcess : mDepositedProcess) {
             depositedProcess.clear();
         }
-        mTotalBackscatteredEnergy = 0.0F;
+        mTotalBackscatteredEnergy = 0.0;
         mBackscatteredParticles.clear();
         mBackscatteredTheta.clear();
         mBackscatteredPhi.clear();
@@ -1023,26 +1021,29 @@ public:
             const auto sourceIndex = mCurrentSourceIndex;
             auto& fields = mFields[sourceIndex];
             *fields.mEventId = event->GetEventID();
-            *fields.mTotalPenetratingEnergy = mTotalPenetratingEnergy;
+            // All per-event computations are performed in double; the values are narrowed to the
+            // float RNTuple fields exactly here, at the storage boundary.
+            *fields.mTotalPenetratingEnergy = static_cast<float>(mTotalPenetratingEnergy);
             *fields.mPenetratingParticles = mPenetratingParticles;
-            *fields.mPenetratingTheta = mPenetratingTheta;
-            *fields.mPenetratingPhi = mPenetratingPhi;
-            *fields.mPenetratingEnergy = mPenetratingEnergy;
-            *fields.mTotalDepositedEnergy = mTotalDepositedEnergy;
+            fields.mPenetratingTheta->assign(mPenetratingTheta.begin(), mPenetratingTheta.end());
+            fields.mPenetratingPhi->assign(mPenetratingPhi.begin(), mPenetratingPhi.end());
+            fields.mPenetratingEnergy->assign(mPenetratingEnergy.begin(), mPenetratingEnergy.end());
+            *fields.mTotalDepositedEnergy = static_cast<float>(mTotalDepositedEnergy);
             for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
-                *fields.mLayerEnergyDeposit[layerIndex] = mLayerEnergyDeposit[layerIndex];
+                *fields.mLayerEnergyDeposit[layerIndex] = static_cast<float>(mLayerEnergyDeposit[layerIndex]);
                 *fields.mDepositedParticles[layerIndex] = mDepositedParticles[layerIndex];
-                *fields.mDepositedX[layerIndex] = mDepositedX[layerIndex];
-                *fields.mDepositedY[layerIndex] = mDepositedY[layerIndex];
-                *fields.mDepositedZ[layerIndex] = mDepositedZ[layerIndex];
-                *fields.mDepositedWeight[layerIndex] = mDepositedWeight[layerIndex];
+                fields.mDepositedX[layerIndex]->assign(mDepositedX[layerIndex].begin(), mDepositedX[layerIndex].end());
+                fields.mDepositedY[layerIndex]->assign(mDepositedY[layerIndex].begin(), mDepositedY[layerIndex].end());
+                fields.mDepositedZ[layerIndex]->assign(mDepositedZ[layerIndex].begin(), mDepositedZ[layerIndex].end());
+                fields.mDepositedWeight[layerIndex]->assign(mDepositedWeight[layerIndex].begin(),
+                                                            mDepositedWeight[layerIndex].end());
                 *fields.mDepositedProcess[layerIndex] = mDepositedProcess[layerIndex];
             }
-            *fields.mTotalBackscatteredEnergy = mTotalBackscatteredEnergy;
+            *fields.mTotalBackscatteredEnergy = static_cast<float>(mTotalBackscatteredEnergy);
             *fields.mBackscatteredParticles = mBackscatteredParticles;
-            *fields.mBackscatteredTheta = mBackscatteredTheta;
-            *fields.mBackscatteredPhi = mBackscatteredPhi;
-            *fields.mBackscatteredEnergy = mBackscatteredEnergy;
+            fields.mBackscatteredTheta->assign(mBackscatteredTheta.begin(), mBackscatteredTheta.end());
+            fields.mBackscatteredPhi->assign(mBackscatteredPhi.begin(), mBackscatteredPhi.end());
+            fields.mBackscatteredEnergy->assign(mBackscatteredEnergy.begin(), mBackscatteredEnergy.end());
             // Fill the entry into the RNTuple of the source category drawn for this event. Filling only
             // buffers data in memory; the actual file write happens in the explicit FlushCluster call,
             // which is serialized across all parallel writers through the file-access mutex.
@@ -1061,25 +1062,25 @@ public:
                                   mTotalBackscatteredEnergy);
     }
 
-    auto AddPenetratingParticle(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
+    auto AddPenetratingParticle(const std::string& particleName, const G4ThreeVector& direction, double energy) -> void {
         AddExitPoint(mPenetratingParticles, mPenetratingTheta, mPenetratingPhi, mPenetratingEnergy,
                      mTotalPenetratingEnergy, particleName, direction, energy);
         mRunAction.AddPenetratingEnergy(mCurrentSourceIndex, particleName, energy);
     }
 
     auto AddDepositedEnergy(int layerIndex, const std::string& particleName, const G4ThreeVector& position,
-                       float energyDeposit, const std::string& processName) -> void {
+                            double energyDeposit, const std::string& processName) -> void {
         mTotalDepositedEnergy += energyDeposit;
         mLayerEnergyDeposit[layerIndex] += energyDeposit;
         mDepositedParticles[layerIndex].push_back(particleName);
-        mDepositedX[layerIndex].push_back(static_cast<float>(position.x()));
-        mDepositedY[layerIndex].push_back(static_cast<float>(position.y()));
-        mDepositedZ[layerIndex].push_back(static_cast<float>(position.z()));
+        mDepositedX[layerIndex].push_back(position.x());
+        mDepositedY[layerIndex].push_back(position.y());
+        mDepositedZ[layerIndex].push_back(position.z());
         mDepositedWeight[layerIndex].push_back(energyDeposit);
         mDepositedProcess[layerIndex].push_back(processName);
     }
 
-    auto AddBackscatteredParticle(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
+    auto AddBackscatteredParticle(const std::string& particleName, const G4ThreeVector& direction, double energy) -> void {
         AddExitPoint(mBackscatteredParticles, mBackscatteredTheta, mBackscatteredPhi, mBackscatteredEnergy,
                      mTotalBackscatteredEnergy, particleName, direction, energy);
         mRunAction.AddBackscatteredEnergy(mCurrentSourceIndex, particleName, energy);
@@ -1152,14 +1153,14 @@ private:
         fields.mBackscatteredEnergy = entry.GetPtr<std::vector<float>>("e_bsc");
     }
 
-    auto AddExitPoint(std::vector<std::string>& particleNames, std::vector<float>& thetas, std::vector<float>& phis,
-                      std::vector<float>& energies, float& totalEnergy, const std::string& particleName,
-                      const G4ThreeVector& direction, float energy) -> void {
+    auto AddExitPoint(std::vector<std::string>& particleNames, std::vector<double>& thetas, std::vector<double>& phis,
+                      std::vector<double>& energies, double& totalEnergy, const std::string& particleName,
+                      const G4ThreeVector& direction, double energy) -> void {
         totalEnergy += energy;
         particleNames.push_back(particleName);
         const auto z = std::clamp(direction.z(), -1.0, 1.0);
-        thetas.push_back(static_cast<float>(std::acos(z)));
-        phis.push_back(static_cast<float>(std::atan2(direction.y(), direction.x())));
+        thetas.push_back(std::acos(z));
+        phis.push_back(std::atan2(direction.y(), direction.x()));
         energies.push_back(energy);
     }
 
@@ -1173,24 +1174,24 @@ private:
     std::vector<std::unique_ptr<ROOT::REntry>> mEntries;
     std::vector<ROOT::RNTupleFillStatus> mFillStatuses;
     std::vector<SourceFields> mFields;
-    float mTotalPenetratingEnergy{0.0F};
+    double mTotalPenetratingEnergy{0.0};
     std::vector<std::string> mPenetratingParticles;
-    std::vector<float> mPenetratingTheta;
-    std::vector<float> mPenetratingPhi;
-    std::vector<float> mPenetratingEnergy;
-    float mTotalDepositedEnergy{0.0F};
-    std::vector<float> mLayerEnergyDeposit;
+    std::vector<double> mPenetratingTheta;
+    std::vector<double> mPenetratingPhi;
+    std::vector<double> mPenetratingEnergy;
+    double mTotalDepositedEnergy{0.0};
+    std::vector<double> mLayerEnergyDeposit;
     std::vector<std::vector<std::string>> mDepositedParticles;
-    std::vector<std::vector<float>> mDepositedX;
-    std::vector<std::vector<float>> mDepositedY;
-    std::vector<std::vector<float>> mDepositedZ;
-    std::vector<std::vector<float>> mDepositedWeight;
+    std::vector<std::vector<double>> mDepositedX;
+    std::vector<std::vector<double>> mDepositedY;
+    std::vector<std::vector<double>> mDepositedZ;
+    std::vector<std::vector<double>> mDepositedWeight;
     std::vector<std::vector<std::string>> mDepositedProcess;
-    float mTotalBackscatteredEnergy{0.0F};
+    double mTotalBackscatteredEnergy{0.0};
     std::vector<std::string> mBackscatteredParticles;
-    std::vector<float> mBackscatteredTheta;
-    std::vector<float> mBackscatteredPhi;
-    std::vector<float> mBackscatteredEnergy;
+    std::vector<double> mBackscatteredTheta;
+    std::vector<double> mBackscatteredPhi;
+    std::vector<double> mBackscatteredEnergy;
 };
 
 class SteppingAction : public G4UserSteppingAction {
@@ -1218,7 +1219,7 @@ public:
         const auto process = step->GetPostStepPoint()->GetProcessDefinedStep();
         const auto processName = process != nullptr ? process->GetProcessName() : "<null>";
         mEventAction.AddDepositedEnergy(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
-                                   step->GetPostStepPoint()->GetPosition(), static_cast<float>(energyDeposit), processName);
+                                   step->GetPostStepPoint()->GetPosition(), energyDeposit, processName);
     }
 
 private:
@@ -1270,7 +1271,7 @@ public:
             return;
         }
         const auto direction = track->GetMomentumDirection();
-        const auto energy = static_cast<float>(track->GetKineticEnergy());
+        const auto energy = track->GetKineticEnergy();
         const auto particleName = definition->GetParticleName();
         if (direction.z() >= 0.0) {
             mEventAction.AddPenetratingParticle(particleName, direction, energy);
