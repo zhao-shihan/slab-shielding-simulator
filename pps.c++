@@ -35,8 +35,10 @@
 #include "G4VUserActionInitialization.hh"
 #include "G4VUserDetectorConstruction.hh"
 #include "G4VUserPrimaryGeneratorAction.hh"
+#include "Randomize.hh"
 #include "ROOT/REntry.hxx"
 #include "ROOT/RNTupleFillContext.hxx"
+#include "ROOT/RNTupleFillStatus.hxx"
 #include "ROOT/RNTupleModel.hxx"
 #include "ROOT/RNTupleParallelWriter.hxx"
 #include "ROOT/RNTupleWriteOptions.hxx"
@@ -51,6 +53,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -66,18 +69,21 @@ auto DefaultThreadCount() -> int {
     return coreCount > 0 ? static_cast<int>(coreCount) : 1;
 }
 
-constexpr auto poissonUpperLimit{2.3};
-constexpr auto ratioTolerance{1e-6};
-
 struct Layer {
     std::string mMaterialName;
     double mThickness{0.0};
 };
 
+struct RadiationSource {
+    std::string mParticleName;
+    double mEnergy{0.0};
+    double mIntensity{1.0};
+    double mWeight{1.0};
+};
+
 struct Config {
     std::vector<Layer> mLayers;
-    double mEnergy{0.0};
-    std::string mParticleName;
+    std::vector<RadiationSource> mSources;
     std::string mOutputFileName{"pps_output.root"};
     std::string mPhysicsListName{"QGSP_BIC_AllHP_EMZ"};
     int mThreads{DefaultThreadCount()};
@@ -108,14 +114,18 @@ auto ParseQuantity(const std::string& text, const std::map<std::string, double>&
         throw std::invalid_argument("cannot parse numeric value from '" + text + "'");
     }
     stream >> suffix;
-    if (suffix.empty()) {
-        return value;
+    if (not suffix.empty()) {
+        const auto unit = units.find(suffix);
+        if (unit == units.end()) {
+            throw std::invalid_argument("unknown unit '" + suffix + "' in '" + text + "'");
+        }
+        value *= unit->second;
     }
-    const auto unit = units.find(suffix);
-    if (unit == units.end()) {
-        throw std::invalid_argument("unknown unit '" + suffix + "' in '" + text + "'");
+    // Reject NaN/inf and unit overflows (e.g. "1e308 MeV").
+    if (not std::isfinite(value)) {
+        throw std::invalid_argument("non-finite numeric value in '" + text + "'");
     }
-    return value * unit->second;
+    return value;
 }
 
 auto ParseLength(const std::string& text) -> double {
@@ -183,6 +193,75 @@ auto ParseLayers(const std::string& text) -> std::vector<Layer> {
     return layers;
 }
 
+auto ParseRadiationSources(const std::string& text) -> std::vector<RadiationSource> {
+    auto sources = std::vector<RadiationSource>{};
+    auto intensitySpecified = std::vector<bool>{};
+    auto stream = std::istringstream{text};
+    auto sourceSpec = std::string{};
+    while (std::getline(stream, sourceSpec, ';')) {
+        if (sourceSpec.empty()) {
+            throw std::invalid_argument("empty source specification in '" + text + "'");
+        }
+        const auto firstColon = sourceSpec.find(':');
+        if (firstColon == std::string::npos) {
+            throw std::invalid_argument(
+                "source '" + sourceSpec + "' must have the form 'particle:energy[:intensity]', e.g. e+:10 MeV:15");
+        }
+        const auto secondColon = sourceSpec.find(':', firstColon + 1);
+        auto source = RadiationSource{};
+        source.mParticleName = Trim(sourceSpec.substr(0, firstColon));
+        source.mEnergy = ParseEnergy(Trim(sourceSpec.substr(firstColon + 1, secondColon - firstColon - 1)));
+        if (source.mParticleName.empty()) {
+            throw std::invalid_argument("source '" + sourceSpec + "' has an empty particle name");
+        }
+        if (source.mEnergy <= 0.0) {
+            throw std::invalid_argument("source '" + sourceSpec + "' has a non-positive energy");
+        }
+        if (secondColon != std::string::npos) {
+            const auto intensityText = Trim(sourceSpec.substr(secondColon + 1));
+            auto parseIndex = std::size_t{0};
+            try {
+                source.mIntensity = std::stod(intensityText, &parseIndex);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("cannot parse intensity '" + intensityText + "' in source '" + sourceSpec + "'");
+            }
+            if (parseIndex != intensityText.size()) {
+                throw std::invalid_argument("cannot parse intensity '" + intensityText + "' in source '" + sourceSpec + "'");
+            }
+            if (source.mIntensity <= 0.0) {
+                throw std::invalid_argument("source '" + sourceSpec + "' has a non-positive intensity");
+            }
+            if (not std::isfinite(source.mIntensity)) {
+                throw std::invalid_argument("source '" + sourceSpec + "' has a non-finite intensity");
+            }
+            intensitySpecified.push_back(true);
+        } else {
+            intensitySpecified.push_back(false);
+        }
+        sources.push_back(std::move(source));
+    }
+    if (sources.empty()) {
+        throw std::invalid_argument("at least one radiation source is required");
+    }
+    if (sources.size() > 1) {
+        for (auto index{0}; index < static_cast<int>(sources.size()); ++index) {
+            if (not intensitySpecified[index]) {
+                throw std::invalid_argument(
+                    "source '" + sources[index].mParticleName + "' is missing its relative intensity; "
+                                                                "the intensity may be omitted only when the source list contains a single entry");
+            }
+        }
+    }
+    auto totalIntensity{0.0};
+    for (const auto& source : sources) {
+        totalIntensity += source.mIntensity;
+    }
+    for (auto& source : sources) {
+        source.mWeight = source.mIntensity / totalIntensity;
+    }
+    return sources;
+}
+
 auto FormatEnergy(double energy) -> std::string {
     auto stream = std::ostringstream{};
     stream << G4BestUnit(energy, "Energy");
@@ -192,15 +271,21 @@ auto FormatEnergy(double energy) -> std::string {
 auto PrintUsage(const char* programName) -> void {
     G4cout
         << "usage: " << programName << " [options] [macroFile]\n"
-        << "simulate one particle per event passing through a material slab and record per-event\n"
-        << "energy depositions inside the slab and particles penetrating or backscattering into an\n"
-        << "RNTuple 'run{runId}' inside a ROOT file\n"
+        << "simulate one primary particle per event from a compound radiation source passing through a material\n"
+        << "slab, recording per-event energy depositions inside the slab and particles penetrating or backscattering\n"
+        << "into the world boundary; each source category is stored into its own RNTuple 'run{runId}_src{typeId}'\n"
+        << "inside a ROOT file\n"
         << "\n"
         << "required options:\n"
         << "  -m, --material <spec>    material layers as semicolon-separated 'name:thickness' entries, built in\n"
         << "                           order from the source, e.g. \"G4_WATER:10 cm;G4_Cu:5 cm\"\n"
-        << "  -e, --energy <value>     primary kinetic energy; bare value in MeV or with a unit, e.g. \"100 MeV\"\n"
-        << "  -p, --particle <name>    primary particle name, e.g. proton, neutron, gamma (Geant4 particle table)\n"
+        << "  -s, --radiation-src <spec>\n"
+        << "                           compound radiation source as semicolon-separated 'particle:energy[:intensity]'\n"
+        << "                           entries; the intensity is the relative intensity of the source and may be\n"
+        << "                           omitted only when the list contains a single source, e.g.\n"
+        << "                           \"e+:10 MeV:15;gamma:3 MeV:12\" or \"neutron:1 MeV\"; intensities are\n"
+        << "                           normalized to probabilities and every event emits one primary whose source\n"
+        << "                           type is drawn from the resulting multinomial distribution\n"
         << "\n"
         << "optional options:\n"
         << "  -n, --n-event <count>    simulate <count> events in batch mode; may be combined with --ui to\n"
@@ -237,10 +322,8 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
             config.mHelp = true;
         } else if (argument == "-m" or argument == "--material") {
             config.mLayers = ParseLayers(nextValue(i, argument));
-        } else if (argument == "-e" or argument == "--energy") {
-            config.mEnergy = ParseEnergy(nextValue(i, argument));
-        } else if (argument == "-p" or argument == "--particle") {
-            config.mParticleName = nextValue(i, argument);
+        } else if (argument == "-s" or argument == "--radiation-src") {
+            config.mSources = ParseRadiationSources(nextValue(i, argument));
         } else if (argument == "-o" or argument == "--output") {
             config.mOutputFileName = nextValue(i, argument);
         } else if (argument == "-l" or argument == "--physics") {
@@ -279,11 +362,8 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
         if (config.mLayers.empty()) {
             throw std::invalid_argument("required option --material is missing");
         }
-        if (config.mEnergy <= 0.0) {
-            throw std::invalid_argument("required option --energy is missing or not positive");
-        }
-        if (config.mParticleName.empty()) {
-            throw std::invalid_argument("required option --particle is missing");
+        if (config.mSources.empty()) {
+            throw std::invalid_argument("required option --radiation-src is missing");
         }
         if (config.mThreads < 1) {
             throw std::invalid_argument("--threads must be at least 1");
@@ -306,9 +386,11 @@ auto ValidateMaterials(const Config& config) -> void {
     }
 }
 
-auto ValidateParticle(const Config& config) -> void {
-    if (G4ParticleTable::GetParticleTable()->FindParticle(config.mParticleName) == nullptr) {
-        throw std::invalid_argument("particle '" + config.mParticleName + "' not found in the particle table");
+auto ValidateSources(const Config& config) -> void {
+    for (const auto& source : config.mSources) {
+        if (G4ParticleTable::GetParticleTable()->FindParticle(source.mParticleName) == nullptr) {
+            throw std::invalid_argument("particle '" + source.mParticleName + "' not found in the particle table");
+        }
     }
 }
 
@@ -345,50 +427,35 @@ public:
         mInitialized = true;
     }
 
-    auto BeginRun(int runId, int layerCount) -> void {
+    auto BeginRun(int runId, int layerCount, int sourceCount) -> void {
         try {
-            auto model = ROOT::RNTupleModel::CreateBare();
-            model->MakeField<int>("event_id");
-            model->MakeField<float>("total_e_pen");
-            model->MakeField<std::vector<std::string>>("particle_pen");
-            model->MakeField<std::vector<float>>("theta_pen");
-            model->MakeField<std::vector<float>>("phi_pen");
-            model->MakeField<std::vector<float>>("e_pen");
-            model->MakeField<float>("total_e_dep");
-            for (auto layerIndex{0}; layerIndex < layerCount; ++layerIndex) {
-                const auto suffix = std::to_string(layerIndex);
-                model->MakeField<float>("e_dep_" + suffix);
-                model->MakeField<std::vector<std::string>>("particle_dep_" + suffix);
-                model->MakeField<std::vector<float>>("x_dep_" + suffix);
-                model->MakeField<std::vector<float>>("y_dep_" + suffix);
-                model->MakeField<std::vector<float>>("z_dep_" + suffix);
-                model->MakeField<std::vector<float>>("w_dep_" + suffix);
-                model->MakeField<std::vector<std::string>>("proc_dep_" + suffix);
-            }
-            model->MakeField<float>("total_e_bsc");
-            model->MakeField<std::vector<std::string>>("particle_bsc");
-            model->MakeField<std::vector<float>>("theta_bsc");
-            model->MakeField<std::vector<float>>("phi_bsc");
-            model->MakeField<std::vector<float>>("e_bsc");
+            mWriters.clear();
+            mWriters.reserve(static_cast<std::size_t>(sourceCount));
             auto options = ROOT::RNTupleWriteOptions{};
             options.SetCompression(ROOT::RCompressionSetting::EDefaults::kUseGeneralPurpose);
             options.SetUseImplicitMT(ROOT::RNTupleWriteOptions::EImplicitMT::kOff);
-            mWriter = ROOT::RNTupleParallelWriter::Append(std::move(model), "run" + std::to_string(runId), *mFile, options);
+            for (auto type{0}; type < sourceCount; ++type) {
+                auto model = CreateModel(layerCount);
+                const auto name = "run" + std::to_string(runId) + "_src" + std::to_string(type);
+                mWriters.push_back(ROOT::RNTupleParallelWriter::Append(std::move(model), name, *mFile, options));
+            }
         } catch (const std::exception& error) {
-            G4cerr << "error: failed to create RNTuple 'run" << runId << "': " << error.what() << G4endl;
+            G4cerr << "error: failed to create RNTuples for run " << runId << ": " << error.what() << G4endl;
             std::quick_exit(EXIT_FAILURE);
         }
     }
 
-    auto CreateFillContext() -> std::shared_ptr<ROOT::RNTupleFillContext> {
-        return mWriter->CreateFillContext();
+    auto CreateFillContext(int sourceIndex) -> std::shared_ptr<ROOT::RNTupleFillContext> {
+        return mWriters[sourceIndex]->CreateFillContext();
     }
 
     auto EndRun() -> void {
-        if (mWriter != nullptr) {
-            mWriter->CommitDataset();
-            mWriter.reset();
+        for (auto& writer : mWriters) {
+            if (writer != nullptr) {
+                writer->CommitDataset();
+            }
         }
+        mWriters.clear();
     }
 
     auto Finalize() -> void {
@@ -400,11 +467,45 @@ public:
         mInitialized = false;
     }
 
+    // RNTupleParallelWriter instances that share one TFile are not synchronized with each other,
+    // so every actual file write (cluster flush) must be serialized through this mutex.
+    auto FileAccessMutex() -> std::mutex& {
+        return mFileAccessMutex;
+    }
+
 private:
+    auto CreateModel(int layerCount) -> std::unique_ptr<ROOT::RNTupleModel> {
+        auto model = ROOT::RNTupleModel::CreateBare();
+        model->MakeField<int>("event_id");
+        model->MakeField<float>("total_e_pen");
+        model->MakeField<std::vector<std::string>>("particle_pen");
+        model->MakeField<std::vector<float>>("theta_pen");
+        model->MakeField<std::vector<float>>("phi_pen");
+        model->MakeField<std::vector<float>>("e_pen");
+        model->MakeField<float>("total_e_dep");
+        for (auto layerIndex{0}; layerIndex < layerCount; ++layerIndex) {
+            const auto suffix = std::to_string(layerIndex);
+            model->MakeField<float>("e_dep_" + suffix);
+            model->MakeField<std::vector<std::string>>("particle_dep_" + suffix);
+            model->MakeField<std::vector<float>>("x_dep_" + suffix);
+            model->MakeField<std::vector<float>>("y_dep_" + suffix);
+            model->MakeField<std::vector<float>>("z_dep_" + suffix);
+            model->MakeField<std::vector<float>>("w_dep_" + suffix);
+            model->MakeField<std::vector<std::string>>("proc_dep_" + suffix);
+        }
+        model->MakeField<float>("total_e_bsc");
+        model->MakeField<std::vector<std::string>>("particle_bsc");
+        model->MakeField<std::vector<float>>("theta_bsc");
+        model->MakeField<std::vector<float>>("phi_bsc");
+        model->MakeField<std::vector<float>>("e_bsc");
+        return model;
+    }
+
     OutputWriter() = default;
 
     std::unique_ptr<TFile> mFile;
-    std::unique_ptr<ROOT::RNTupleParallelWriter> mWriter;
+    std::vector<std::unique_ptr<ROOT::RNTupleParallelWriter>> mWriters;
+    std::mutex mFileAccessMutex;
     bool mInitialized{false};
 };
 
@@ -462,97 +563,151 @@ private:
 
 class SimulationRun : public G4Run {
 public:
-    explicit SimulationRun(int layerCount) :
-        mLayerDepEnergySums(layerCount, 0.0),
-        mLayerDepEnergySumsSq(layerCount, 0.0) {}
+    explicit SimulationRun(int layerCount, int sourceCount) :
+        mSourceStatistics(sourceCount, SourceStatistics{layerCount}),
+        mLayerCount{layerCount} {}
 
     auto Merge(const G4Run* other) -> void override {
         G4Run::Merge(other);
-        const auto* otherSimulationRun = static_cast<const SimulationRun*>(other);
-        mPenEnergySum += otherSimulationRun->mPenEnergySum;
-        mPenEnergySumSq += otherSimulationRun->mPenEnergySumSq;
-        mDepEnergySum += otherSimulationRun->mDepEnergySum;
-        mDepEnergySumSq += otherSimulationRun->mDepEnergySumSq;
-        for (auto layerIndex{0}; layerIndex < static_cast<int>(mLayerDepEnergySums.size()); ++layerIndex) {
-            mLayerDepEnergySums[layerIndex] += otherSimulationRun->mLayerDepEnergySums[layerIndex];
-            mLayerDepEnergySumsSq[layerIndex] += otherSimulationRun->mLayerDepEnergySumsSq[layerIndex];
+        const SimulationRun* otherSimulationRun = static_cast<const SimulationRun*>(other);
+        for (auto sourceIndex{0}; sourceIndex < static_cast<int>(mSourceStatistics.size()); ++sourceIndex) {
+            auto& target = mSourceStatistics[sourceIndex];
+            const auto& source = otherSimulationRun->mSourceStatistics[sourceIndex];
+            target.mEventCount += source.mEventCount;
+            target.mPenetrationEnergySum += source.mPenetrationEnergySum;
+            target.mPenetrationEnergySumSq += source.mPenetrationEnergySumSq;
+            target.mDepositionEnergySum += source.mDepositionEnergySum;
+            target.mDepositionEnergySumSq += source.mDepositionEnergySumSq;
+            for (auto layerIndex{0}; layerIndex < static_cast<int>(target.mLayerDepositionEnergySums.size()); ++layerIndex) {
+                target.mLayerDepositionEnergySums[layerIndex] += source.mLayerDepositionEnergySums[layerIndex];
+                target.mLayerDepositionEnergySumsSq[layerIndex] += source.mLayerDepositionEnergySumsSq[layerIndex];
+            }
+            target.mBackscatteringEnergySum += source.mBackscatteringEnergySum;
+            target.mBackscatteringEnergySumSq += source.mBackscatteringEnergySumSq;
+            AddToMap(target.mPenetrationParticleCount, source.mPenetrationParticleCount);
+            AddToMap(target.mPenetrationParticleEnergySum, source.mPenetrationParticleEnergySum);
+            AddToMap(target.mPenetrationParticleEnergySumSq, source.mPenetrationParticleEnergySumSq);
+            AddToMap(target.mBackscatteringParticleCount, source.mBackscatteringParticleCount);
+            AddToMap(target.mBackscatteringParticleEnergySum, source.mBackscatteringParticleEnergySum);
+            AddToMap(target.mBackscatteringParticleEnergySumSq, source.mBackscatteringParticleEnergySumSq);
         }
-        mBscEnergySum += otherSimulationRun->mBscEnergySum;
-        mBscEnergySumSq += otherSimulationRun->mBscEnergySumSq;
-        AddToMap(mPenParticleCount, otherSimulationRun->mPenParticleCount);
-        AddToMap(mPenParticleEnergySum, otherSimulationRun->mPenParticleEnergySum);
-        AddToMap(mPenParticleEnergySumSq, otherSimulationRun->mPenParticleEnergySumSq);
-        AddToMap(mBscParticleCount, otherSimulationRun->mBscParticleCount);
-        AddToMap(mBscParticleEnergySum, otherSimulationRun->mBscParticleEnergySum);
-        AddToMap(mBscParticleEnergySumSq, otherSimulationRun->mBscParticleEnergySumSq);
     }
 
-    auto AddEventResult(double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
+    auto AddEventResult(int sourceIndex, double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
                         double backscatteringEnergy) -> void {
-        mPenEnergySum += penetrationEnergy;
-        mPenEnergySumSq += penetrationEnergy * penetrationEnergy;
+        auto& statistics = mSourceStatistics[sourceIndex];
+        ++statistics.mEventCount;
+        statistics.mPenetrationEnergySum += penetrationEnergy;
+        statistics.mPenetrationEnergySumSq += penetrationEnergy * penetrationEnergy;
         auto totalDepositionEnergy{0.0};
         for (auto layerIndex{0}; layerIndex < static_cast<int>(layerDepositionEnergies.size()); ++layerIndex) {
             const auto layerDepositionEnergy = layerDepositionEnergies[layerIndex];
-            mLayerDepEnergySums[layerIndex] += layerDepositionEnergy;
-            mLayerDepEnergySumsSq[layerIndex] += layerDepositionEnergy * layerDepositionEnergy;
+            statistics.mLayerDepositionEnergySums[layerIndex] += layerDepositionEnergy;
+            statistics.mLayerDepositionEnergySumsSq[layerIndex] += layerDepositionEnergy * layerDepositionEnergy;
             totalDepositionEnergy += layerDepositionEnergy;
         }
-        mDepEnergySum += totalDepositionEnergy;
-        mDepEnergySumSq += totalDepositionEnergy * totalDepositionEnergy;
-        mBscEnergySum += backscatteringEnergy;
-        mBscEnergySumSq += backscatteringEnergy * backscatteringEnergy;
+        statistics.mDepositionEnergySum += totalDepositionEnergy;
+        statistics.mDepositionEnergySumSq += totalDepositionEnergy * totalDepositionEnergy;
+        statistics.mBackscatteringEnergySum += backscatteringEnergy;
+        statistics.mBackscatteringEnergySumSq += backscatteringEnergy * backscatteringEnergy;
     }
 
-    auto AddPenetrationEnergy(const std::string& particleName, double energy) -> void {
-        mPenParticleCount[particleName] += 1.0;
-        mPenParticleEnergySum[particleName] += energy;
-        mPenParticleEnergySumSq[particleName] += energy * energy;
+    auto AddPenetrationEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+        auto& statistics = mSourceStatistics[sourceIndex];
+        statistics.mPenetrationParticleCount[particleName] += 1.0;
+        statistics.mPenetrationParticleEnergySum[particleName] += energy;
+        statistics.mPenetrationParticleEnergySumSq[particleName] += energy * energy;
     }
 
-    auto AddBackscatteringEnergy(const std::string& particleName, double energy) -> void {
-        mBscParticleCount[particleName] += 1.0;
-        mBscParticleEnergySum[particleName] += energy;
-        mBscParticleEnergySumSq[particleName] += energy * energy;
+    auto AddBackscatteringEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+        auto& statistics = mSourceStatistics[sourceIndex];
+        statistics.mBackscatteringParticleCount[particleName] += 1.0;
+        statistics.mBackscatteringParticleEnergySum[particleName] += energy;
+        statistics.mBackscatteringParticleEnergySumSq[particleName] += energy * energy;
     }
 
-    auto GetPenEnergySum() const -> double { return mPenEnergySum; }
-    auto GetPenEnergySumSq() const -> double { return mPenEnergySumSq; }
-    auto GetDepEnergySum() const -> double { return mDepEnergySum; }
-    auto GetDepEnergySumSq() const -> double { return mDepEnergySumSq; }
-    auto GetLayerDepEnergySum(int layerIndex) const -> double { return mLayerDepEnergySums[layerIndex]; }
-    auto GetLayerDepEnergySumSq(int layerIndex) const -> double { return mLayerDepEnergySumsSq[layerIndex]; }
-    auto GetLayerCount() const -> int { return static_cast<int>(mLayerDepEnergySums.size()); }
-    auto GetBscEnergySum() const -> double { return mBscEnergySum; }
-    auto GetBscEnergySumSq() const -> double { return mBscEnergySumSq; }
-    auto GetPenParticleCounts() const -> const std::map<std::string, double>& { return mPenParticleCount; }
-    auto GetPenParticleEnergySums() const -> const std::map<std::string, double>& { return mPenParticleEnergySum; }
-    auto GetPenParticleEnergySumsSq() const -> const std::map<std::string, double>& { return mPenParticleEnergySumSq; }
-    auto GetBscParticleCounts() const -> const std::map<std::string, double>& { return mBscParticleCount; }
-    auto GetBscParticleEnergySums() const -> const std::map<std::string, double>& { return mBscParticleEnergySum; }
-    auto GetBscParticleEnergySumsSq() const -> const std::map<std::string, double>& { return mBscParticleEnergySumSq; }
+    auto GetEventCount(int sourceIndex) const -> long long {
+        return mSourceStatistics[sourceIndex].mEventCount;
+    }
+    auto GetPenetrationEnergySum(int sourceIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mPenetrationEnergySum;
+    }
+    auto GetPenetrationEnergySumSq(int sourceIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mPenetrationEnergySumSq;
+    }
+    auto GetDepositionEnergySum(int sourceIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mDepositionEnergySum;
+    }
+    auto GetDepositionEnergySumSq(int sourceIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mDepositionEnergySumSq;
+    }
+    auto GetLayerDepositionEnergySum(int sourceIndex, int layerIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mLayerDepositionEnergySums[layerIndex];
+    }
+    auto GetLayerDepositionEnergySumSq(int sourceIndex, int layerIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mLayerDepositionEnergySumsSq[layerIndex];
+    }
+    auto GetLayerCount() const -> int {
+        return mLayerCount;
+    }
+    auto GetSourceCount() const -> int {
+        return static_cast<int>(mSourceStatistics.size());
+    }
+    auto GetBackscatteringEnergySum(int sourceIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mBackscatteringEnergySum;
+    }
+    auto GetBackscatteringEnergySumSq(int sourceIndex) const -> double {
+        return mSourceStatistics[sourceIndex].mBackscatteringEnergySumSq;
+    }
+    auto GetPenetrationParticleCounts(int sourceIndex) const -> const std::map<std::string, double>& {
+        return mSourceStatistics[sourceIndex].mPenetrationParticleCount;
+    }
+    auto GetPenetrationParticleEnergySums(int sourceIndex) const -> const std::map<std::string, double>& {
+        return mSourceStatistics[sourceIndex].mPenetrationParticleEnergySum;
+    }
+    auto GetPenetrationParticleEnergySumsSq(int sourceIndex) const -> const std::map<std::string, double>& {
+        return mSourceStatistics[sourceIndex].mPenetrationParticleEnergySumSq;
+    }
+    auto GetBackscatteringParticleCounts(int sourceIndex) const -> const std::map<std::string, double>& {
+        return mSourceStatistics[sourceIndex].mBackscatteringParticleCount;
+    }
+    auto GetBackscatteringParticleEnergySums(int sourceIndex) const -> const std::map<std::string, double>& {
+        return mSourceStatistics[sourceIndex].mBackscatteringParticleEnergySum;
+    }
+    auto GetBackscatteringParticleEnergySumsSq(int sourceIndex) const -> const std::map<std::string, double>& {
+        return mSourceStatistics[sourceIndex].mBackscatteringParticleEnergySumSq;
+    }
 
 private:
+    struct SourceStatistics {
+        explicit SourceStatistics(int layerCount) :
+            mLayerDepositionEnergySums(layerCount, 0.0),
+            mLayerDepositionEnergySumsSq(layerCount, 0.0) {}
+        long long mEventCount{0};
+        double mPenetrationEnergySum{0.0};
+        double mPenetrationEnergySumSq{0.0};
+        double mDepositionEnergySum{0.0};
+        double mDepositionEnergySumSq{0.0};
+        std::vector<double> mLayerDepositionEnergySums;
+        std::vector<double> mLayerDepositionEnergySumsSq;
+        double mBackscatteringEnergySum{0.0};
+        double mBackscatteringEnergySumSq{0.0};
+        std::map<std::string, double> mPenetrationParticleCount;
+        std::map<std::string, double> mPenetrationParticleEnergySum;
+        std::map<std::string, double> mPenetrationParticleEnergySumSq;
+        std::map<std::string, double> mBackscatteringParticleCount;
+        std::map<std::string, double> mBackscatteringParticleEnergySum;
+        std::map<std::string, double> mBackscatteringParticleEnergySumSq;
+    };
+
     auto AddToMap(std::map<std::string, double>& target, const std::map<std::string, double>& source) -> void {
         for (const auto& [key, value] : source) {
             target[key] += value;
         }
     }
 
-    double mPenEnergySum{0.0};
-    double mPenEnergySumSq{0.0};
-    double mDepEnergySum{0.0};
-    double mDepEnergySumSq{0.0};
-    std::vector<double> mLayerDepEnergySums;
-    std::vector<double> mLayerDepEnergySumsSq;
-    double mBscEnergySum{0.0};
-    double mBscEnergySumSq{0.0};
-    std::map<std::string, double> mPenParticleCount;
-    std::map<std::string, double> mPenParticleEnergySum;
-    std::map<std::string, double> mPenParticleEnergySumSq;
-    std::map<std::string, double> mBscParticleCount;
-    std::map<std::string, double> mBscParticleEnergySum;
-    std::map<std::string, double> mBscParticleEnergySumSq;
+    std::vector<SourceStatistics> mSourceStatistics;
+    int mLayerCount{0};
 };
 
 class RunAction : public G4UserRunAction {
@@ -562,22 +717,28 @@ public:
     ~RunAction() override = default;
 
     auto GenerateRun() -> G4Run* override {
-        return new SimulationRun{static_cast<int>(mConfig.mLayers.size())};
+        SimulationRun* run = new SimulationRun{static_cast<int>(mConfig.mLayers.size()),
+                                               static_cast<int>(mConfig.mSources.size())};
+        mCurrentRun = run;
+        return run;
     }
 
     auto BeginOfRunAction(const G4Run* run) -> void override {
-        mCurrentRun = const_cast<SimulationRun*>(static_cast<const SimulationRun*>(run));
         if (IsMaster()) {
-            OutputWriter::Instance().BeginRun(run->GetRunID(), static_cast<int>(mConfig.mLayers.size()));
+            OutputWriter::Instance().BeginRun(run->GetRunID(), static_cast<int>(mConfig.mLayers.size()),
+                                              static_cast<int>(mConfig.mSources.size()));
         }
         if (not IsMaster() or not G4Threading::IsMultithreadedApplication()) {
-            mFillContext = OutputWriter::Instance().CreateFillContext();
-            mEntry = mFillContext->CreateEntry();
+            mFillContexts.clear();
+            mFillContexts.reserve(mConfig.mSources.size());
+            for (auto sourceIndex{0}; sourceIndex < static_cast<int>(mConfig.mSources.size()); ++sourceIndex) {
+                mFillContexts.push_back(OutputWriter::Instance().CreateFillContext(sourceIndex));
+            }
         }
     }
 
     auto EndOfRunAction(const G4Run* run) -> void override {
-        ReleaseFillState();
+        FlushAndReleaseFillState();
         if (IsMaster()) {
             OutputWriter::Instance().EndRun();
             PrintStatistics(static_cast<const SimulationRun&>(*run));
@@ -585,27 +746,39 @@ public:
         }
     }
 
-    auto AddEventResult(double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
+    auto AddEventResult(int sourceIndex, double penetrationEnergy, const std::vector<float>& layerDepositionEnergies,
                         double backscatteringEnergy) -> void {
-        mCurrentRun->AddEventResult(penetrationEnergy, layerDepositionEnergies, backscatteringEnergy);
+        mCurrentRun->AddEventResult(sourceIndex, penetrationEnergy, layerDepositionEnergies, backscatteringEnergy);
     }
 
-    auto AddPenetrationEnergy(const std::string& particleName, double energy) -> void {
-        mCurrentRun->AddPenetrationEnergy(particleName, energy);
+    auto AddPenetrationEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+        mCurrentRun->AddPenetrationEnergy(sourceIndex, particleName, energy);
     }
 
-    auto AddBackscatteringEnergy(const std::string& particleName, double energy) -> void {
-        mCurrentRun->AddBackscatteringEnergy(particleName, energy);
+    auto AddBackscatteringEnergy(int sourceIndex, const std::string& particleName, double energy) -> void {
+        mCurrentRun->AddBackscatteringEnergy(sourceIndex, particleName, energy);
     }
 
-    auto GetFillContext() const -> std::shared_ptr<ROOT::RNTupleFillContext> {
-        return mFillContext;
+    auto GetFillContext(int sourceIndex) const -> std::shared_ptr<ROOT::RNTupleFillContext> {
+        return mFillContexts[sourceIndex];
     }
 
 private:
-    auto ReleaseFillState() -> void {
-        mEntry.reset();
-        mFillContext.reset();
+    auto FlushAndReleaseFillState() -> void {
+        if (mFillContexts.empty()) {
+            return;
+        }
+        // Parallel writers that share one TFile are not synchronized with each other, so all actual
+        // file writes must be serialized. Flush every remaining cluster under the file-access mutex
+        // first; afterwards the fill-context destructors become no-ops (FlushCluster of an empty
+        // context returns immediately) and no longer touch the file.
+        {
+            std::lock_guard<std::mutex> guard{OutputWriter::Instance().FileAccessMutex()};
+            for (const auto& fillContext : mFillContexts) {
+                fillContext->FlushCluster();
+            }
+        }
+        mFillContexts.clear();
     }
 
     auto PrintStatistics(const SimulationRun& run) -> void {
@@ -615,18 +788,43 @@ private:
         }
         G4cout << '\n';
         G4cout << "===============================================================================\n";
-        G4cout << " energy ratio (incident " << G4BestUnit(mConfig.mEnergy, "Energy") << ' ' << mConfig.mParticleName
-               << ", " << eventCount << " events):\n";
-        PrintEnergyRatio("penetration ratio (pen)", run.GetPenEnergySum(), run.GetPenEnergySumSq(), eventCount);
-        PrintEnergyRatio("deposition ratio (dep)", run.GetDepEnergySum(), run.GetDepEnergySumSq(), eventCount);
-        for (auto layerIndex{0}; layerIndex < run.GetLayerCount(); ++layerIndex) {
-            const auto label = "  in layer " + std::to_string(layerIndex) + " (" + mConfig.mLayers[layerIndex].mMaterialName + ')';
-            PrintEnergyRatio(label, run.GetLayerDepEnergySum(layerIndex), run.GetLayerDepEnergySumSq(layerIndex), eventCount);
+        auto printedAnySource{false};
+        for (auto sourceIndex{0}; sourceIndex < run.GetSourceCount(); ++sourceIndex) {
+            const auto& source = mConfig.mSources[sourceIndex];
+            const auto sourceEventCount = run.GetEventCount(sourceIndex);
+            if (sourceEventCount < 1) {
+                continue;
+            }
+            if (printedAnySource) {
+                // Separator between consecutive sources.
+                G4cout << "-------------------------------------------------------------------------------\n";
+            }
+            printedAnySource = true;
+            G4cout << " source " << sourceIndex << ": " << source.mParticleName << ' '
+                   << G4BestUnit(source.mEnergy, "Energy") << ", intensity "
+                   << std::fixed << std::setprecision(4) << source.mWeight << ", "
+                   << sourceEventCount << " events:\n";
+            G4cout << std::defaultfloat << std::setprecision(6);
+            PrintEnergyRatio("penetration ratio (pen)", run.GetPenetrationEnergySum(sourceIndex),
+                             run.GetPenetrationEnergySumSq(sourceIndex), sourceEventCount, source.mEnergy);
+            PrintEnergyRatio("deposition ratio (dep)", run.GetDepositionEnergySum(sourceIndex),
+                             run.GetDepositionEnergySumSq(sourceIndex), sourceEventCount, source.mEnergy);
+            for (auto layerIndex{0}; layerIndex < run.GetLayerCount(); ++layerIndex) {
+                const auto label = "  in layer " + std::to_string(layerIndex) + " (" +
+                                   mConfig.mLayers[layerIndex].mMaterialName + ')';
+                PrintEnergyRatio(label, run.GetLayerDepositionEnergySum(sourceIndex, layerIndex),
+                                 run.GetLayerDepositionEnergySumSq(sourceIndex, layerIndex), sourceEventCount,
+                                 source.mEnergy);
+            }
+            PrintEnergyRatio("back-scattering ratio (bsc)", run.GetBackscatteringEnergySum(sourceIndex),
+                             run.GetBackscatteringEnergySumSq(sourceIndex), sourceEventCount, source.mEnergy);
+            PrintParticleStatistics("penetration particles", run.GetPenetrationParticleCounts(sourceIndex),
+                                    run.GetPenetrationParticleEnergySums(sourceIndex),
+                                    run.GetPenetrationParticleEnergySumsSq(sourceIndex));
+            PrintParticleStatistics("back-scattering particles", run.GetBackscatteringParticleCounts(sourceIndex),
+                                    run.GetBackscatteringParticleEnergySums(sourceIndex),
+                                    run.GetBackscatteringParticleEnergySumsSq(sourceIndex));
         }
-        PrintEnergyRatio("back-scattering ratio (bsc)", run.GetBscEnergySum(), run.GetBscEnergySumSq(), eventCount);
-        G4cout << "-------------------------------------------------------------------------------\n";
-        PrintParticleStatistics("penetration particles", run.GetPenParticleCounts(), run.GetPenParticleEnergySums(), run.GetPenParticleEnergySumsSq());
-        PrintParticleStatistics("back-scattering particles", run.GetBscParticleCounts(), run.GetBscParticleEnergySums(), run.GetBscParticleEnergySumsSq());
         G4cout << "===============================================================================\n"
                << G4endl;
     }
@@ -637,8 +835,8 @@ private:
         if (particleCounts.empty()) {
             return;
         }
-        G4cout << ' ' << title << ":\n";
-        G4cout << "   "
+        G4cout << "   " << title << ":\n";
+        G4cout << "     "
                << std::setw(14) << "particle"
                << std::setw(20) << "<E>"
                << std::setw(20) << "rms"
@@ -649,7 +847,7 @@ private:
             const auto meanEnergy = energySum / count;
             const auto variance = energySumSq / count - meanEnergy * meanEnergy;
             const auto rmsEnergy = variance > 0.0 ? std::sqrt(variance) : 0.0;
-            G4cout << "   "
+            G4cout << "     "
                    << std::setw(14) << particleName
                    << std::setw(20) << FormatEnergy(meanEnergy)
                    << std::setw(20) << FormatEnergy(rmsEnergy)
@@ -657,154 +855,214 @@ private:
         }
     }
 
-    auto PrintEnergyRatio(const std::string& label, double sumEnergy, double sumEnergySq, G4int eventCount) -> void {
-        const auto meanEnergy = sumEnergy / eventCount;
-        const auto ratio = meanEnergy / mConfig.mEnergy;
-        const auto variance = (sumEnergySq - sumEnergy * sumEnergy / eventCount) / (eventCount - 1);
-        const auto ratioError = std::sqrt(variance / eventCount) / mConfig.mEnergy;
+    auto PrintEnergyRatio(const std::string& label, double sumEnergy, double sumEnergySq, G4int eventCount,
+                          double incidentEnergy) -> void {
+        const auto meanEnergy{sumEnergy / eventCount};
+        const auto ratio{meanEnergy / incidentEnergy};
+        // Clamp to non-negative: with eventCount < 2 or exact cancellation the sample variance is
+        // zero (or slightly negative from float rounding) and sqrt of a negative value would be NaN.
+        const auto variance{std::max(0.0, (sumEnergySq - sumEnergy * sumEnergy / eventCount) / (eventCount - 1))};
+        const auto ratioError{std::sqrt(variance / eventCount) / incidentEnergy};
         G4cout << "   " << std::left << std::setw(45) << label << '(' << 100.0 * ratio << " +/- "
                << 100.0 * ratioError << ") %" << G4endl;
     }
 
     const Config& mConfig;
     SimulationRun* mCurrentRun{nullptr};
-    std::shared_ptr<ROOT::RNTupleFillContext> mFillContext;
-    std::unique_ptr<ROOT::REntry> mEntry;
+    std::vector<std::shared_ptr<ROOT::RNTupleFillContext>> mFillContexts;
 };
 
 class EventAction : public G4UserEventAction {
 public:
-    explicit EventAction(RunAction* runAction, int layerCount) :
+    explicit EventAction(RunAction& runAction, int layerCount, int sourceCount) :
         mRunAction{runAction},
         mLayerCount{layerCount},
-        mLayerEdep(layerCount, 0.0F),
-        mParticleDep(layerCount),
-        mXDep(layerCount),
-        mYDep(layerCount),
-        mZDep(layerCount),
-        mWDep(layerCount),
-        mProcDep(layerCount) {}
+        mSourceCount{sourceCount},
+        mFillContexts(sourceCount),
+        mEntries(sourceCount),
+        mFillStatuses(sourceCount),
+        mFields(sourceCount),
+        mLayerEnergyDeposit(layerCount, 0.0F),
+        mDepositionParticles(layerCount),
+        mDepositionX(layerCount),
+        mDepositionY(layerCount),
+        mDepositionZ(layerCount),
+        mDepositionWeight(layerCount),
+        mDepositionProcess(layerCount) {}
     ~EventAction() override = default;
+
+    auto SetSourceIndex(int sourceIndex) -> void {
+        mCurrentSourceIndex = sourceIndex;
+    }
 
     auto BeginOfEventAction(const G4Event*) -> void override {
         const auto runId = G4RunManager::GetRunManager()->GetCurrentRun()->GetRunID();
         if (runId != mRunId) {
             mRunId = runId;
-            mFillContext = mRunAction->GetFillContext().get();
-            mEntry = mFillContext->CreateEntry();
-            mEventIdField = mEntry->GetPtr<int>("event_id");
-            mTotalEPenField = mEntry->GetPtr<float>("total_e_pen");
-            mParticlePenField = mEntry->GetPtr<std::vector<std::string>>("particle_pen");
-            mThetaPenField = mEntry->GetPtr<std::vector<float>>("theta_pen");
-            mPhiPenField = mEntry->GetPtr<std::vector<float>>("phi_pen");
-            mEPenField = mEntry->GetPtr<std::vector<float>>("e_pen");
-            mTotalEdepField = mEntry->GetPtr<float>("total_e_dep");
-            mLayerEdepFields.clear();
-            mParticleDepFields.clear();
-            mXDepFields.clear();
-            mYDepFields.clear();
-            mZDepFields.clear();
-            mWDepFields.clear();
-            mProcDepFields.clear();
-            for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
-                const auto suffix = std::to_string(layerIndex);
-                mLayerEdepFields.push_back(mEntry->GetPtr<float>("e_dep_" + suffix));
-                mParticleDepFields.push_back(mEntry->GetPtr<std::vector<std::string>>("particle_dep_" + suffix));
-                mXDepFields.push_back(mEntry->GetPtr<std::vector<float>>("x_dep_" + suffix));
-                mYDepFields.push_back(mEntry->GetPtr<std::vector<float>>("y_dep_" + suffix));
-                mZDepFields.push_back(mEntry->GetPtr<std::vector<float>>("z_dep_" + suffix));
-                mWDepFields.push_back(mEntry->GetPtr<std::vector<float>>("w_dep_" + suffix));
-                mProcDepFields.push_back(mEntry->GetPtr<std::vector<std::string>>("proc_dep_" + suffix));
+            for (auto sourceIndex{0}; sourceIndex < mSourceCount; ++sourceIndex) {
+                // Weak references on purpose: the fill contexts are owned by RunAction and must be
+                // destroyed by the worker's EndOfRunAction so that RNTupleParallelWriter::CommitDataset()
+                // (which requires all contexts to be gone) can run on the master. Holding shared_ptrs
+                // here would keep the contexts alive and make CommitDataset throw.
+                const auto fillContext{mRunAction.GetFillContext(sourceIndex)};
+                mFillContexts[sourceIndex] = fillContext;
+                mEntries[sourceIndex] = fillContext->CreateEntry();
+                BindFields(*mEntries[sourceIndex], mFields[sourceIndex]);
             }
-            mTotalEBscField = mEntry->GetPtr<float>("total_e_bsc");
-            mParticleBscField = mEntry->GetPtr<std::vector<std::string>>("particle_bsc");
-            mThetaBscField = mEntry->GetPtr<std::vector<float>>("theta_bsc");
-            mPhiBscField = mEntry->GetPtr<std::vector<float>>("phi_bsc");
-            mEBscField = mEntry->GetPtr<std::vector<float>>("e_bsc");
         }
-        mTotalEPen = 0.0F;
-        mParticlePen.clear();
-        mThetaPen.clear();
-        mPhiPen.clear();
-        mEPen.clear();
-        mTotalEdep = 0.0F;
-        for (auto& layerEdep : mLayerEdep) {
-            layerEdep = 0.0F;
+        mTotalPenetrationEnergy = 0.0F;
+        mPenetrationParticles.clear();
+        mPenetrationTheta.clear();
+        mPenetrationPhi.clear();
+        mPenetrationEnergy.clear();
+        mTotalDepositionEnergy = 0.0F;
+        for (auto& layerEnergyDeposit : mLayerEnergyDeposit) {
+            layerEnergyDeposit = 0.0F;
         }
-        for (auto& particleDep : mParticleDep) {
-            particleDep.clear();
+        for (auto& depositionParticles : mDepositionParticles) {
+            depositionParticles.clear();
         }
-        for (auto& xDep : mXDep) {
-            xDep.clear();
+        for (auto& depositionX : mDepositionX) {
+            depositionX.clear();
         }
-        for (auto& yDep : mYDep) {
-            yDep.clear();
+        for (auto& depositionY : mDepositionY) {
+            depositionY.clear();
         }
-        for (auto& zDep : mZDep) {
-            zDep.clear();
+        for (auto& depositionZ : mDepositionZ) {
+            depositionZ.clear();
         }
-        for (auto& wDep : mWDep) {
-            wDep.clear();
+        for (auto& depositionWeight : mDepositionWeight) {
+            depositionWeight.clear();
         }
-        for (auto& procDep : mProcDep) {
-            procDep.clear();
+        for (auto& depositionProcess : mDepositionProcess) {
+            depositionProcess.clear();
         }
-        mTotalEBsc = 0.0F;
-        mParticleBsc.clear();
-        mThetaBsc.clear();
-        mPhiBsc.clear();
-        mEBsc.clear();
+        mTotalBackscatteringEnergy = 0.0F;
+        mBackscatteringParticles.clear();
+        mBackscatteringTheta.clear();
+        mBackscatteringPhi.clear();
+        mBackscatteringEnergy.clear();
     }
 
     auto EndOfEventAction(const G4Event* event) -> void override {
-        *mEventIdField = event->GetEventID();
-        *mTotalEPenField = mTotalEPen;
-        *mParticlePenField = mParticlePen;
-        *mThetaPenField = mThetaPen;
-        *mPhiPenField = mPhiPen;
-        *mEPenField = mEPen;
-        *mTotalEdepField = mTotalEdep;
+        const auto sourceIndex = mCurrentSourceIndex;
+        auto& fields = mFields[sourceIndex];
+        *fields.mEventId = event->GetEventID();
+        *fields.mTotalPenetrationEnergy = mTotalPenetrationEnergy;
+        *fields.mPenetrationParticles = mPenetrationParticles;
+        *fields.mPenetrationTheta = mPenetrationTheta;
+        *fields.mPenetrationPhi = mPenetrationPhi;
+        *fields.mPenetrationEnergy = mPenetrationEnergy;
+        *fields.mTotalDepositionEnergy = mTotalDepositionEnergy;
         for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
-            *mLayerEdepFields[layerIndex] = mLayerEdep[layerIndex];
-            *mParticleDepFields[layerIndex] = mParticleDep[layerIndex];
-            *mXDepFields[layerIndex] = mXDep[layerIndex];
-            *mYDepFields[layerIndex] = mYDep[layerIndex];
-            *mZDepFields[layerIndex] = mZDep[layerIndex];
-            *mWDepFields[layerIndex] = mWDep[layerIndex];
-            *mProcDepFields[layerIndex] = mProcDep[layerIndex];
+            *fields.mLayerEnergyDeposit[layerIndex] = mLayerEnergyDeposit[layerIndex];
+            *fields.mDepositionParticles[layerIndex] = mDepositionParticles[layerIndex];
+            *fields.mDepositionX[layerIndex] = mDepositionX[layerIndex];
+            *fields.mDepositionY[layerIndex] = mDepositionY[layerIndex];
+            *fields.mDepositionZ[layerIndex] = mDepositionZ[layerIndex];
+            *fields.mDepositionWeight[layerIndex] = mDepositionWeight[layerIndex];
+            *fields.mDepositionProcess[layerIndex] = mDepositionProcess[layerIndex];
         }
-        *mTotalEBscField = mTotalEBsc;
-        *mParticleBscField = mParticleBsc;
-        *mThetaBscField = mThetaBsc;
-        *mPhiBscField = mPhiBsc;
-        *mEBscField = mEBsc;
-        mFillContext->Fill(*mEntry);
-        mRunAction->AddEventResult(mTotalEPen, mLayerEdep, mTotalEBsc);
+        *fields.mTotalBackscatteringEnergy = mTotalBackscatteringEnergy;
+        *fields.mBackscatteringParticles = mBackscatteringParticles;
+        *fields.mBackscatteringTheta = mBackscatteringTheta;
+        *fields.mBackscatteringPhi = mBackscatteringPhi;
+        *fields.mBackscatteringEnergy = mBackscatteringEnergy;
+        // Fill the entry into the RNTuple of the source category drawn for this event. Filling only
+        // buffers data in memory; the actual file write happens in the explicit FlushCluster call,
+        // which is serialized across all parallel writers through the file-access mutex.
+        const auto fillContext{mFillContexts[sourceIndex].lock()};
+        if (fillContext == nullptr) {
+            G4cerr << "error: RNTuple fill context for source " << sourceIndex << " is no longer available" << G4endl;
+        } else {
+            fillContext->FillNoFlush(*mEntries[sourceIndex], mFillStatuses[sourceIndex]);
+            if (mFillStatuses[sourceIndex].ShouldFlushCluster()) {
+                std::lock_guard<std::mutex> guard{OutputWriter::Instance().FileAccessMutex()};
+                fillContext->FlushCluster();
+            }
+        }
+        mRunAction.AddEventResult(sourceIndex, mTotalPenetrationEnergy, mLayerEnergyDeposit, mTotalBackscatteringEnergy);
     }
 
     auto AddPenetration(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
-        AddExitPoint(mParticlePen, mThetaPen, mPhiPen, mEPen, mTotalEPen, particleName, direction, energy);
-        mRunAction->AddPenetrationEnergy(particleName, energy);
+        AddExitPoint(mPenetrationParticles, mPenetrationTheta, mPenetrationPhi, mPenetrationEnergy,
+                     mTotalPenetrationEnergy, particleName, direction, energy);
+        mRunAction.AddPenetrationEnergy(mCurrentSourceIndex, particleName, energy);
     }
 
-    auto AddDeposition(int layerIndex, const std::string& particleName, const G4ThreeVector& position, float edep,
-                       const std::string& processName) -> void {
-        mTotalEdep += edep;
-        mLayerEdep[layerIndex] += edep;
-        mParticleDep[layerIndex].push_back(particleName);
-        mXDep[layerIndex].push_back(static_cast<float>(position.x()));
-        mYDep[layerIndex].push_back(static_cast<float>(position.y()));
-        mZDep[layerIndex].push_back(static_cast<float>(position.z()));
-        mWDep[layerIndex].push_back(edep);
-        mProcDep[layerIndex].push_back(processName);
+    auto AddDeposition(int layerIndex, const std::string& particleName, const G4ThreeVector& position,
+                       float energyDeposit, const std::string& processName) -> void {
+        mTotalDepositionEnergy += energyDeposit;
+        mLayerEnergyDeposit[layerIndex] += energyDeposit;
+        mDepositionParticles[layerIndex].push_back(particleName);
+        mDepositionX[layerIndex].push_back(static_cast<float>(position.x()));
+        mDepositionY[layerIndex].push_back(static_cast<float>(position.y()));
+        mDepositionZ[layerIndex].push_back(static_cast<float>(position.z()));
+        mDepositionWeight[layerIndex].push_back(energyDeposit);
+        mDepositionProcess[layerIndex].push_back(processName);
     }
 
     auto AddBackscattering(const std::string& particleName, const G4ThreeVector& direction, float energy) -> void {
-        AddExitPoint(mParticleBsc, mThetaBsc, mPhiBsc, mEBsc, mTotalEBsc, particleName, direction, energy);
-        mRunAction->AddBackscatteringEnergy(particleName, energy);
+        AddExitPoint(mBackscatteringParticles, mBackscatteringTheta, mBackscatteringPhi, mBackscatteringEnergy,
+                     mTotalBackscatteringEnergy, particleName, direction, energy);
+        mRunAction.AddBackscatteringEnergy(mCurrentSourceIndex, particleName, energy);
     }
 
 private:
+    struct SourceFields {
+        std::shared_ptr<int> mEventId;
+        std::shared_ptr<float> mTotalPenetrationEnergy;
+        std::shared_ptr<std::vector<std::string>> mPenetrationParticles;
+        std::shared_ptr<std::vector<float>> mPenetrationTheta;
+        std::shared_ptr<std::vector<float>> mPenetrationPhi;
+        std::shared_ptr<std::vector<float>> mPenetrationEnergy;
+        std::shared_ptr<float> mTotalDepositionEnergy;
+        std::vector<std::shared_ptr<float>> mLayerEnergyDeposit;
+        std::vector<std::shared_ptr<std::vector<std::string>>> mDepositionParticles;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositionX;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositionY;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositionZ;
+        std::vector<std::shared_ptr<std::vector<float>>> mDepositionWeight;
+        std::vector<std::shared_ptr<std::vector<std::string>>> mDepositionProcess;
+        std::shared_ptr<float> mTotalBackscatteringEnergy;
+        std::shared_ptr<std::vector<std::string>> mBackscatteringParticles;
+        std::shared_ptr<std::vector<float>> mBackscatteringTheta;
+        std::shared_ptr<std::vector<float>> mBackscatteringPhi;
+        std::shared_ptr<std::vector<float>> mBackscatteringEnergy;
+    };
+
+    auto BindFields(ROOT::REntry& entry, SourceFields& fields) -> void {
+        fields.mEventId = entry.GetPtr<int>("event_id");
+        fields.mTotalPenetrationEnergy = entry.GetPtr<float>("total_e_pen");
+        fields.mPenetrationParticles = entry.GetPtr<std::vector<std::string>>("particle_pen");
+        fields.mPenetrationTheta = entry.GetPtr<std::vector<float>>("theta_pen");
+        fields.mPenetrationPhi = entry.GetPtr<std::vector<float>>("phi_pen");
+        fields.mPenetrationEnergy = entry.GetPtr<std::vector<float>>("e_pen");
+        fields.mTotalDepositionEnergy = entry.GetPtr<float>("total_e_dep");
+        fields.mLayerEnergyDeposit.clear();
+        fields.mDepositionParticles.clear();
+        fields.mDepositionX.clear();
+        fields.mDepositionY.clear();
+        fields.mDepositionZ.clear();
+        fields.mDepositionWeight.clear();
+        fields.mDepositionProcess.clear();
+        for (auto layerIndex{0}; layerIndex < mLayerCount; ++layerIndex) {
+            const auto suffix = std::to_string(layerIndex);
+            fields.mLayerEnergyDeposit.push_back(entry.GetPtr<float>("e_dep_" + suffix));
+            fields.mDepositionParticles.push_back(entry.GetPtr<std::vector<std::string>>("particle_dep_" + suffix));
+            fields.mDepositionX.push_back(entry.GetPtr<std::vector<float>>("x_dep_" + suffix));
+            fields.mDepositionY.push_back(entry.GetPtr<std::vector<float>>("y_dep_" + suffix));
+            fields.mDepositionZ.push_back(entry.GetPtr<std::vector<float>>("z_dep_" + suffix));
+            fields.mDepositionWeight.push_back(entry.GetPtr<std::vector<float>>("w_dep_" + suffix));
+            fields.mDepositionProcess.push_back(entry.GetPtr<std::vector<std::string>>("proc_dep_" + suffix));
+        }
+        fields.mTotalBackscatteringEnergy = entry.GetPtr<float>("total_e_bsc");
+        fields.mBackscatteringParticles = entry.GetPtr<std::vector<std::string>>("particle_bsc");
+        fields.mBackscatteringTheta = entry.GetPtr<std::vector<float>>("theta_bsc");
+        fields.mBackscatteringPhi = entry.GetPtr<std::vector<float>>("phi_bsc");
+        fields.mBackscatteringEnergy = entry.GetPtr<std::vector<float>>("e_bsc");
+    }
+
     auto AddExitPoint(std::vector<std::string>& particleNames, std::vector<float>& thetas, std::vector<float>& phis,
                       std::vector<float>& energies, float& totalEnergy, const std::string& particleName,
                       const G4ThreeVector& direction, float energy) -> void {
@@ -816,59 +1074,44 @@ private:
         energies.push_back(energy);
     }
 
-    RunAction* mRunAction;
+    RunAction& mRunAction;
     int mLayerCount{0};
-    ROOT::RNTupleFillContext* mFillContext{nullptr};
-    std::unique_ptr<ROOT::REntry> mEntry;
+    int mSourceCount{0};
+    int mCurrentSourceIndex{0};
     int mRunId{-1};
-    std::shared_ptr<int> mEventIdField;
-    std::shared_ptr<float> mTotalEPenField;
-    std::shared_ptr<std::vector<std::string>> mParticlePenField;
-    std::shared_ptr<std::vector<float>> mThetaPenField;
-    std::shared_ptr<std::vector<float>> mPhiPenField;
-    std::shared_ptr<std::vector<float>> mEPenField;
-    std::shared_ptr<float> mTotalEdepField;
-    std::vector<std::shared_ptr<float>> mLayerEdepFields;
-    std::vector<std::shared_ptr<std::vector<std::string>>> mParticleDepFields;
-    std::vector<std::shared_ptr<std::vector<float>>> mXDepFields;
-    std::vector<std::shared_ptr<std::vector<float>>> mYDepFields;
-    std::vector<std::shared_ptr<std::vector<float>>> mZDepFields;
-    std::vector<std::shared_ptr<std::vector<float>>> mWDepFields;
-    std::vector<std::shared_ptr<std::vector<std::string>>> mProcDepFields;
-    std::shared_ptr<float> mTotalEBscField;
-    std::shared_ptr<std::vector<std::string>> mParticleBscField;
-    std::shared_ptr<std::vector<float>> mThetaBscField;
-    std::shared_ptr<std::vector<float>> mPhiBscField;
-    std::shared_ptr<std::vector<float>> mEBscField;
-    float mTotalEPen{0.0F};
-    std::vector<std::string> mParticlePen;
-    std::vector<float> mThetaPen;
-    std::vector<float> mPhiPen;
-    std::vector<float> mEPen;
-    float mTotalEdep{0.0F};
-    std::vector<float> mLayerEdep;
-    std::vector<std::vector<std::string>> mParticleDep;
-    std::vector<std::vector<float>> mXDep;
-    std::vector<std::vector<float>> mYDep;
-    std::vector<std::vector<float>> mZDep;
-    std::vector<std::vector<float>> mWDep;
-    std::vector<std::vector<std::string>> mProcDep;
-    float mTotalEBsc{0.0F};
-    std::vector<std::string> mParticleBsc;
-    std::vector<float> mThetaBsc;
-    std::vector<float> mPhiBsc;
-    std::vector<float> mEBsc;
+    std::vector<std::weak_ptr<ROOT::RNTupleFillContext>> mFillContexts;
+    std::vector<std::unique_ptr<ROOT::REntry>> mEntries;
+    std::vector<ROOT::RNTupleFillStatus> mFillStatuses;
+    std::vector<SourceFields> mFields;
+    float mTotalPenetrationEnergy{0.0F};
+    std::vector<std::string> mPenetrationParticles;
+    std::vector<float> mPenetrationTheta;
+    std::vector<float> mPenetrationPhi;
+    std::vector<float> mPenetrationEnergy;
+    float mTotalDepositionEnergy{0.0F};
+    std::vector<float> mLayerEnergyDeposit;
+    std::vector<std::vector<std::string>> mDepositionParticles;
+    std::vector<std::vector<float>> mDepositionX;
+    std::vector<std::vector<float>> mDepositionY;
+    std::vector<std::vector<float>> mDepositionZ;
+    std::vector<std::vector<float>> mDepositionWeight;
+    std::vector<std::vector<std::string>> mDepositionProcess;
+    float mTotalBackscatteringEnergy{0.0F};
+    std::vector<std::string> mBackscatteringParticles;
+    std::vector<float> mBackscatteringTheta;
+    std::vector<float> mBackscatteringPhi;
+    std::vector<float> mBackscatteringEnergy;
 };
 
 class SteppingAction : public G4UserSteppingAction {
 public:
-    explicit SteppingAction(EventAction* eventAction) :
+    explicit SteppingAction(EventAction& eventAction) :
         mEventAction{eventAction} {}
     ~SteppingAction() override = default;
 
     auto UserSteppingAction(const G4Step* step) -> void override {
         if (mMaterialVolumes.empty()) {
-            const auto detectorConstruction = static_cast<const DetectorConstruction*>(
+            const DetectorConstruction* detectorConstruction = static_cast<const DetectorConstruction*>(
                 G4RunManager::GetRunManager()->GetUserDetectorConstruction());
             mMaterialVolumes = detectorConstruction->GetMaterialVolumes();
         }
@@ -878,24 +1121,24 @@ public:
             return;
         }
         const auto layerIndex = layerIt->second;
-        const auto edep = step->GetTotalEnergyDeposit();
-        if (edep <= 0.0) {
+        const auto energyDeposit = step->GetTotalEnergyDeposit();
+        if (energyDeposit <= 0.0) {
             return;
         }
         const auto process = step->GetPostStepPoint()->GetProcessDefinedStep();
         const auto processName = process != nullptr ? process->GetProcessName() : "<null>";
-        mEventAction->AddDeposition(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
-                                    step->GetPostStepPoint()->GetPosition(), static_cast<float>(edep), processName);
+        mEventAction.AddDeposition(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
+                                   step->GetPostStepPoint()->GetPosition(), static_cast<float>(energyDeposit), processName);
     }
 
 private:
-    EventAction* mEventAction;
+    EventAction& mEventAction;
     std::unordered_map<const G4LogicalVolume*, int> mMaterialVolumes;
 };
 
 class TrackingAction : public G4UserTrackingAction {
 public:
-    explicit TrackingAction(EventAction* eventAction, bool includeNeutrinos) :
+    explicit TrackingAction(EventAction& eventAction, bool includeNeutrinos) :
         mEventAction{eventAction},
         mIncludeNeutrinos{includeNeutrinos} {}
     ~TrackingAction() override = default;
@@ -913,40 +1156,70 @@ public:
         const auto energy = static_cast<float>(track->GetKineticEnergy());
         const auto particleName = definition->GetParticleName();
         if (direction.z() >= 0.0) {
-            mEventAction->AddPenetration(particleName, direction, energy);
+            mEventAction.AddPenetration(particleName, direction, energy);
         } else {
-            mEventAction->AddBackscattering(particleName, direction, energy);
+            mEventAction.AddBackscattering(particleName, direction, energy);
         }
     }
 
 private:
-    EventAction* mEventAction;
+    EventAction& mEventAction;
     bool mIncludeNeutrinos{false};
 };
 
 class PrimaryGeneratorAction : public G4VUserPrimaryGeneratorAction {
 public:
-    explicit PrimaryGeneratorAction(const Config& config) :
-        mConfig{config} {
-        const auto particle = G4ParticleTable::GetParticleTable()->FindParticle(config.mParticleName);
-        if (particle == nullptr) {
-            throw std::invalid_argument("particle '" + config.mParticleName + "' not found in the particle table");
+    explicit PrimaryGeneratorAction(const Config& config, EventAction& eventAction) :
+        mConfig{config},
+        mEventAction{eventAction} {
+        auto cumulative{0.0};
+        mParticleDefinitions.reserve(config.mSources.size());
+        for (const auto& source : config.mSources) {
+            G4ParticleDefinition* particle = G4ParticleTable::GetParticleTable()->FindParticle(source.mParticleName);
+            if (particle == nullptr) {
+                throw std::invalid_argument("particle '" + source.mParticleName + "' not found in the particle table");
+            }
+            mParticleDefinitions.push_back(particle);
+            // The intensities were already normalized into probabilities (mWeight); the cumulative
+            // probabilities are used to draw the source type of each primary from the multinomial
+            // distribution (one trial per event because every event carries a single primary particle)
+            // with Geant4's per-thread random engine.
+            cumulative += source.mWeight;
+            mCumulativeProbabilities.push_back(cumulative);
         }
+        // Guard against floating-point rounding in the last interval.
+        mCumulativeProbabilities.back() = 1.0;
         mParticleGun = std::make_unique<G4ParticleGun>(1);
-        mParticleGun->SetParticleDefinition(particle);
         mParticleGun->SetParticleMomentumDirection(G4ThreeVector{0.0, 0.0, 1.0});
-        mParticleGun->SetParticleEnergy(config.mEnergy);
     }
     ~PrimaryGeneratorAction() override = default;
 
     auto GeneratePrimaries(G4Event* event) -> void override {
+        const auto sourceIndex = DrawSourceIndex();
+        const auto& source = mConfig.mSources[sourceIndex];
+        mEventAction.SetSourceIndex(sourceIndex);
+        mParticleGun->SetParticleDefinition(mParticleDefinitions[sourceIndex]);
+        mParticleGun->SetParticleEnergy(source.mEnergy);
         mParticleGun->SetParticlePosition(mSourcePosition);
         mParticleGun->GeneratePrimaryVertex(event);
     }
 
 private:
+    // Draw the source type for the current primary particle: a single trial of the multinomial
+    // distribution over the normalized source intensities, sampled with Geant4's random engine
+    // (each worker thread owns its own engine instance, so MT runs stay independent).
+    auto DrawSourceIndex() const -> int {
+        const auto uniformSample{G4UniformRand()};
+        const auto it = std::upper_bound(mCumulativeProbabilities.begin(), mCumulativeProbabilities.end(),
+                                         uniformSample);
+        return it == mCumulativeProbabilities.end() ? static_cast<int>(mCumulativeProbabilities.size()) - 1 : static_cast<int>(it - mCumulativeProbabilities.begin());
+    }
+
     const Config& mConfig;
+    EventAction& mEventAction;
     std::unique_ptr<G4ParticleGun> mParticleGun;
+    std::vector<G4ParticleDefinition*> mParticleDefinitions;
+    std::vector<double> mCumulativeProbabilities;
     G4ThreeVector mSourcePosition{0.0, 0.0, 0.0};
 };
 
@@ -961,13 +1234,14 @@ public:
     }
 
     auto Build() const -> void override {
-        const auto runAction = new RunAction{mConfig};
+        RunAction* runAction = new RunAction{mConfig};
         SetUserAction(runAction);
-        const auto eventAction = new EventAction{runAction, static_cast<int>(mConfig.mLayers.size())};
+        EventAction* eventAction = new EventAction{*runAction, static_cast<int>(mConfig.mLayers.size()),
+                                                   static_cast<int>(mConfig.mSources.size())};
         SetUserAction(eventAction);
-        SetUserAction(new PrimaryGeneratorAction{mConfig});
-        SetUserAction(new SteppingAction{eventAction});
-        SetUserAction(new TrackingAction{eventAction, mConfig.mIncludeNeutrinos});
+        SetUserAction(new PrimaryGeneratorAction{mConfig, *eventAction});
+        SetUserAction(new SteppingAction{*eventAction});
+        SetUserAction(new TrackingAction{*eventAction, mConfig.mIncludeNeutrinos});
     }
 
 private:
@@ -1022,7 +1296,7 @@ auto main(int argc, char** argv) -> int try {
     G4NuclearLevelData::GetInstance()->GetParameters()->SetVerbose(config.mVerbose);
     runManager->SetUserInitialization(physicsList);
 
-    PPS::ValidateParticle(config);
+    PPS::ValidateSources(config);
 
     PPS::OutputWriter::Instance().Initialize(config.mOutputFileName, config.mOverwrite);
     runManager->SetUserInitialization(new PPS::ActionInitialization{config});
@@ -1035,14 +1309,16 @@ auto main(int argc, char** argv) -> int try {
         config.mEventCount > 0 ? std::max(1, config.mEventCount / 10) : config.mPrintProgress;
     uiManager->ApplyCommand("/run/printProgress " + std::to_string(printProgress));
     if (config.mUI) {
-        std::unique_ptr<G4UIExecutive> ui(new G4UIExecutive{argc, argv});
+        std::unique_ptr<G4UIExecutive> uiExecutive{
+            new G4UIExecutive{argc, argv}
+        };
         for (const auto& command : PPS::defaultVisCommands) {
             uiManager->ApplyCommand(command);
         }
         if (config.mEventCount > 0) {
             uiManager->ApplyCommand("/run/beamOn " + std::to_string(config.mEventCount));
         }
-        ui->SessionStart();
+        uiExecutive->SessionStart();
     } else if (not config.mMacroFileName.empty()) {
         uiManager->ApplyCommand("/control/execute " + config.mMacroFileName);
     } else {

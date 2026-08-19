@@ -11,3 +11,6 @@ find_package(ROOT REQUIRED COMPONENTS ROOTNTuple ROOTNTupleUtil)
 add_executable(pps pps.c++)
 target_include_directories(pps PRIVATE ${ROOT_INCLUDE_DIRS})
 target_link_libraries(pps PRIVATE ${Geant4_LIBRARIES} ${ROOT_LIBRARIES})
+target_compile_options(pps PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /WX>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Werror>)
