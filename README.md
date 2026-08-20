@@ -164,8 +164,8 @@ sss-vis [inputFile] [options]
 | `-x, --x-range <min>:<max>` | Manual x-axis range used by every histogram. |
 | `-y, --y-range <min>:<max>` | Manual y-axis range used by every histogram. |
 | `-z, --z-range <min>:<max>` | Manual z-axis range used by every histogram. |
-| `-s, --xy-fraction <value>` | Fraction of the deposited energy kept by the automatic xy range (default: `0.9`). |
-| `-e, --z-expand <factor>` | Expansion factor of the automatic z range (default: `1.2`). |
+| `-s, --xy-quantile <value>` | Fraction of the deposited energy kept by the automatic xy range (default: `0.9`). |
+| `-e, --z-quantile <value>` | Energy-weighted quantile used as the automatic z upper bound (default: `0.9`). |
 | `-j, --threads <count>` | Implicit-multithreading worker count (default: all CPU cores). |
 | `-f, --force` | Overwrite the output file if it already exists. |
 | `-h, --help` | Print the usage message. |
@@ -174,8 +174,8 @@ sss-vis [inputFile] [options]
 
 When a manual range is not given:
 
-- the **x** and **y** ranges are the *narrowest intervals centred at 0* that contain `--xy-fraction` (default 0.9) of the total deposited energy, trimmed symmetrically from both tails; long distribution tails therefore extend the range only by the energy they actually carry;
-- the **z** range is `--z-expand` (default 1.2) times the interval that contains energy deposition, centred at `z = 0`.
+- the **x** and **y** ranges are the *narrowest intervals centred at 0* that contain `--xy-quantile` (default 0.9) of the total deposited energy, trimmed symmetrically from both tails; long distribution tails therefore extend the range only by the energy they actually carry;
+- the **z** range spans from the *first z with energy deposition* (the minimum deposition z) up to the *energy-weighted `--z-quantile`* (default 0.9) of the deposited energy.
 
 A degenerate range (all depositions at the same position) is widened by a tiny symmetric padding so that the histograms always have a finite span.
 

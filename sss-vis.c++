@@ -87,8 +87,8 @@ struct Config {
     std::optional<Range> mXRange;
     std::optional<Range> mYRange;
     std::optional<Range> mZRange;
-    double mXyEnergyFraction{0.9};
-    double mZExpandFactor{1.2};
+    double mXyQuantile{0.9};
+    double mZQuantile{0.9};
     int mThreads{0};
     bool mForce{false};
     bool mHelp{false};
@@ -234,17 +234,18 @@ auto PrintUsage(const char* programName) -> void {
         << "  -1, --bins-1d <count>    bin count of the 1D z histogram (default: 300)\n"
         << "  -x, --x-range <min>:<max>\n"
         << "                           manual x-axis range used by every histogram (default: narrowest\n"
-        << "                           interval centred at 0 containing <xy-fraction> of the deposited\n"
+        << "                           interval centred at 0 containing <xy-quantile> of the deposited\n"
         << "                           energy)\n"
         << "  -y, --y-range <min>:<max>\n"
         << "                           manual y-axis range (default: as for the x axis)\n"
         << "  -z, --z-range <min>:<max>\n"
-        << "                           manual z-axis range (default: <z-expand> times the interval that\n"
-        << "                           contains energy deposition, centered at z = 0)\n"
-        << "  -s, --xy-fraction <value>\n"
+        << "                           manual z-axis range (default: from the first z with energy\n"
+        << "                           deposition to the <z-quantile> quantile of the deposited energy)\n"
+        << "  -s, --xy-quantile <value>\n"
         << "                           fraction of the deposited energy kept by the automatic xy range\n"
         << "                           (default: 0.9)\n"
-        << "  -e, --z-expand <factor>  expansion factor of the automatic z range (default: 1.2)\n"
+        << "  -e, --z-quantile <value> energy-weighted quantile used as the automatic z upper bound\n"
+        << "                           (default: 0.9)\n"
         << "  -j, --threads <count>    implicit-multithreading worker count (default: all CPU cores)\n"
         << "  -f, --force              overwrite the output file if it already exists\n"
         << "  -h, --help               print this message" << '\n';
@@ -278,16 +279,16 @@ auto ParseCommandLine(int argc, char** argv) -> Config {
             config.mYRange = ParseRange(nextValue(i, argument));
         } else if (argument == "-z" or argument == "--z-range") {
             config.mZRange = ParseRange(nextValue(i, argument));
-        } else if (argument == "-s" or argument == "--xy-fraction") {
-            config.mXyEnergyFraction = ParseDouble(nextValue(i, argument));
-            if (not std::isfinite(config.mXyEnergyFraction) or config.mXyEnergyFraction <= 0.0
-                or config.mXyEnergyFraction > 1.0) {
-                throw std::invalid_argument("--xy-fraction must be in (0, 1]");
+        } else if (argument == "-s" or argument == "--xy-quantile") {
+            config.mXyQuantile = ParseDouble(nextValue(i, argument));
+            if (not std::isfinite(config.mXyQuantile) or config.mXyQuantile <= 0.0
+                or config.mXyQuantile > 1.0) {
+                throw std::invalid_argument("--xy-quantile must be in (0, 1]");
             }
-        } else if (argument == "-e" or argument == "--z-expand") {
-            config.mZExpandFactor = ParseDouble(nextValue(i, argument));
-            if (not std::isfinite(config.mZExpandFactor) or config.mZExpandFactor <= 0.0) {
-                throw std::invalid_argument("--z-expand must be a positive number");
+        } else if (argument == "-e" or argument == "--z-quantile") {
+            config.mZQuantile = ParseDouble(nextValue(i, argument));
+            if (not std::isfinite(config.mZQuantile) or config.mZQuantile <= 0.0 or config.mZQuantile > 1.0) {
+                throw std::invalid_argument("--z-quantile must be in (0, 1]");
             }
         } else if (argument == "-j" or argument == "--threads") {
             config.mThreads = ParseInteger(nextValue(i, argument));
@@ -432,16 +433,28 @@ auto SymmetricEnergyInterval(TH1D& histogram, double fraction) -> Range {
     return Range{-halfWidth, halfWidth};
 }
 
+// Return the energy-weighted quantile of the given fine histogram, i.e. the
+// smallest coordinate below which the requested fraction of the histogram's total
+// deposited energy lies.
+auto EnergyQuantile(TH1D& histogram, double fraction) -> double {
+    auto probability = fraction;
+    auto quantile = 0.0;
+    histogram.GetQuantiles(1, &quantile, &probability);
+    return quantile;
+}
+
 // Determine the histogram ranges. For the xy axes the automatic range is the
 // narrowest interval centred at zero that contains the configured fraction of the
-// deposited energy; it is derived from temporary fine 1D histograms, which are
-// booked first and produced in one event loop when their results are read below.
-// The z range keeps the deposition-interval rule centred at z = 0.
+// deposited energy; for the z axis it spans from the first z with energy
+// deposition to the configured energy-weighted quantile. The ranges are derived
+// from temporary fine 1D histograms, which are booked first and produced in one
+// event loop when their results are read below.
 auto DetermineHistogramRanges(ROOT::RDF::RNode& node, const DepositionStatistics& statistics,
                               const Config& config) -> HistogramRanges {
     auto ranges = HistogramRanges{};
     auto xFine = std::optional<ROOT::RDF::RResultPtr<TH1D>>{};
     auto yFine = std::optional<ROOT::RDF::RResultPtr<TH1D>>{};
+    auto zFine = std::optional<ROOT::RDF::RResultPtr<TH1D>>{};
     if (not config.mXRange.has_value()) {
         // Bin the fine histogram symmetrically around zero over the largest
         // absolute data coordinate, and pad the range slightly beyond it so that
@@ -465,22 +478,34 @@ auto DetermineHistogramRanges(ROOT::RDF::RNode& node, const DepositionStatistics
             yFineRange.mMinimum - yFinePadding, yFineRange.mMaximum + yFinePadding};
         yFine = node.Histo1D<PositionVector, PositionVector>(yFineModel, yPositionColumnName, weightColumnName);
     }
+    if (not config.mZRange.has_value()) {
+        // Bin the fine z histogram over the deposition extent, padded slightly so
+        // that depositions exactly at the extent bounds land inside the range.
+        const auto zBounds = EnsureFiniteSpan(Range{statistics.mZMinimum, statistics.mZMaximum});
+        const auto zFinePadding = 0.001 * (zBounds.mMaximum - zBounds.mMinimum);
+        const auto zFineModel = ROOT::RDF::TH1DModel{
+            "dep_z_fine", "dep_z_fine", fineHistogramBins,
+            zBounds.mMinimum - zFinePadding, zBounds.mMaximum + zFinePadding};
+        zFine = node.Histo1D<PositionVector, PositionVector>(zFineModel, zPositionColumnName, weightColumnName);
+    }
     if (xFine.has_value()) {
-        ranges.mX = EnsureFiniteSpan(SymmetricEnergyInterval(*xFine.value(), config.mXyEnergyFraction));
+        ranges.mX = EnsureFiniteSpan(SymmetricEnergyInterval(*xFine.value(), config.mXyQuantile));
     } else {
         ranges.mX = config.mXRange.value();
     }
     if (yFine.has_value()) {
-        ranges.mY = EnsureFiniteSpan(SymmetricEnergyInterval(*yFine.value(), config.mXyEnergyFraction));
+        ranges.mY = EnsureFiniteSpan(SymmetricEnergyInterval(*yFine.value(), config.mXyQuantile));
     } else {
         ranges.mY = config.mYRange.value();
     }
     if (config.mZRange.has_value()) {
         ranges.mZ = config.mZRange.value();
     } else {
-        const auto span = statistics.mZMaximum - statistics.mZMinimum;
-        const auto halfSpan = 0.5 * config.mZExpandFactor * span;
-        ranges.mZ = EnsureFiniteSpan(Range{-halfSpan, halfSpan});
+        // The quantile is clamped to the deposition extent so that bin-edge
+        // interpolation at extreme fractions cannot overshoot the data bounds.
+        const auto zUpperBound = std::clamp(EnergyQuantile(*zFine.value(), config.mZQuantile),
+                                            statistics.mZMinimum, statistics.mZMaximum);
+        ranges.mZ = EnsureFiniteSpan(Range{statistics.mZMinimum, zUpperBound});
     }
     return ranges;
 }
