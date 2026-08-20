@@ -14,3 +14,10 @@ target_link_libraries(sss PRIVATE ${Geant4_LIBRARIES} ${ROOT_LIBRARIES})
 target_compile_options(sss PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
+
+add_executable(sss-vis sss-vis.c++)
+target_include_directories(sss-vis PRIVATE ${ROOT_INCLUDE_DIRS})
+target_link_libraries(sss-vis PRIVATE ${ROOT_LIBRARIES})
+target_compile_options(sss-vis PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
