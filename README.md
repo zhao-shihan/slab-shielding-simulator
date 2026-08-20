@@ -85,7 +85,7 @@ Run modes (at least one is required):
 | Option | Description |
 | --- | --- |
 | `-n, --n-event <count>` | Simulate `<count>` events in batch mode. May be combined with `--ui` to pre-run events before the interactive session opens. |
-| `-l, --phys-list <name>` | Reference physics list name (default: `QBBC`). |
+| `-l, --phys-list <name>` | Reference physics list name (default: `QBBC_EMZ`). |
 | `-N, --neutrinos` | Include neutrino kinetic energy in the world-boundary energy statistics (neutrinos are ignored by default). |
 | `-j, --threads <count>` | Worker thread count; `1` runs sequentially, `> 1` runs multithreaded (default: all CPU cores). |
 | `-v, --verbose <level>` | Geant4 verbosity level; `0` prints only the banner, progress, and summary (default: `0`). |
@@ -165,7 +165,7 @@ sss-vis [inputFile] [options]
 | `-y, --y-range <min>:<max>` | Manual y-axis range used by every histogram. |
 | `-z, --z-range <min>:<max>` | Manual z-axis range used by every histogram. |
 | `-s, --xy-quantile <value>` | Fraction of the deposited energy kept by the automatic xy range (default: `0.9`). |
-| `-e, --z-quantile <value>` | Energy-weighted quantile used as the automatic z upper bound (default: `0.9`). |
+| `-e, --z-quantile <value>` | Energy-weighted quantile used as the automatic z upper bound (default: `0.95`). |
 | `-j, --threads <count>` | Implicit-multithreading worker count (default: all CPU cores). |
 | `-f, --force` | Overwrite the output file if it already exists. |
 | `-h, --help` | Print the usage message. |
@@ -175,7 +175,7 @@ sss-vis [inputFile] [options]
 When a manual range is not given:
 
 - the **x** and **y** ranges are the *narrowest intervals centred at 0* that contain `--xy-quantile` (default 0.9) of the total deposited energy, trimmed symmetrically from both tails; long distribution tails therefore extend the range only by the energy they actually carry;
-- the **z** range spans from the *first z with energy deposition* (the minimum deposition z) up to the *energy-weighted `--z-quantile`* (default 0.9) of the deposited energy.
+- the **z** range spans from the *first z with energy deposition* (the minimum deposition z) up to the *energy-weighted `--z-quantile`* (default 0.95) of the deposited energy.
 
 A degenerate range (all depositions at the same position) is widened by a tiny symmetric padding so that the histograms always have a finite span.
 
@@ -202,7 +202,7 @@ sss-vis out.root
 
 ## Physics
 
-The default reference physics list is `QBBC`. Any list provided by the Geant4 physics-list factory may be selected with `--phys-list`.
+The default reference physics list is `QBBC_EMZ`. Any list provided by the Geant4 physics-list factory may be selected with `--phys-list`.
 
 ### Geometry and scoring
 

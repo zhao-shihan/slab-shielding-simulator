@@ -88,7 +88,7 @@ struct Config {
     std::optional<Range> mYRange;
     std::optional<Range> mZRange;
     double mXyQuantile{0.9};
-    double mZQuantile{0.9};
+    double mZQuantile{0.95};
     int mThreads{0};
     bool mForce{false};
     bool mHelp{false};
@@ -245,7 +245,7 @@ auto PrintUsage(const char* programName) -> void {
         << "                           fraction of the deposited energy kept by the automatic xy range\n"
         << "                           (default: 0.9)\n"
         << "  -e, --z-quantile <value> energy-weighted quantile used as the automatic z upper bound\n"
-        << "                           (default: 0.9)\n"
+        << "                           (default: 0.95)\n"
         << "  -j, --threads <count>    implicit-multithreading worker count (default: all CPU cores)\n"
         << "  -f, --force              overwrite the output file if it already exists\n"
         << "  -h, --help               print this message" << '\n';

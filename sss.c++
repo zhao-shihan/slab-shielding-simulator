@@ -112,7 +112,7 @@ struct Config {
     std::vector<Layer> mLayers;
     std::vector<RadiationSource> mSources;
     std::string mOutputFileName{"sss_output.root"};
-    std::string mPhysicsListName{"QBBC"};
+    std::string mPhysicsListName{"QBBC_EMZ"};
     int mThreads{DefaultThreadCount()};
     int mVerbose{0};
     bool mIncludeNeutrinos{false};
@@ -442,7 +442,7 @@ auto PrintUsage(const char* programName) -> void {
         << "optional options:\n"
         << "  -n, --n-event <count>    simulate <count> events in batch mode; may be combined with --ui to\n"
         << "                           pre-run events before the interactive session opens\n"
-        << "  -l, --phys-list <name>   reference physics list name (default: QBBC)\n"
+        << "  -l, --phys-list <name>   reference physics list name (default: QBBC_EMZ)\n"
         << "  -N, --neutrinos          include neutrino kinetic energy in the world boundary energy statistics;\n"
         << "                           neutrinos are ignored by default\n"
         << "  -j, --threads <count>    worker thread count; 1 runs sequential, > 1 runs multithreaded (default: all CPU cores)\n"
