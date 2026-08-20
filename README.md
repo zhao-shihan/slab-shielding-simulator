@@ -212,3 +212,4 @@ The default reference physics list is `QBBC`. Any list provided by the Geant4 ph
 - A particle leaving the world boundary with `z ≥ 0` counts as **penetrating**; with `z < 0` it counts as **backscattered**.
 - For unstable primaries, the final step position is the decay vertex, so decay is included automatically in the primary-termination classification.
 - Neutrinos are excluded from the world-boundary energy statistics by default; pass `--neutrinos` to include them.
+- When a step's energy deposition is caused by multiple Coulomb scattering (`msc`), the recorded deposition position is sampled uniformly on the segment connecting the pre-step and post-step positions, because `msc` deposits energy throughout the step; otherwise the post-step position is recorded.

@@ -30,6 +30,7 @@
 #include "G4UserSteppingAction.hh"
 #include "G4UserTrackingAction.hh"
 #include "G4VisExecutive.hh"
+#include "G4VMultipleScattering.hh"
 #include "G4VPhysicalVolume.hh"
 #include "G4VProcess.hh"
 #include "G4VUserActionInitialization.hh"
@@ -1451,8 +1452,17 @@ public:
         }
         const auto process = step->GetPostStepPoint()->GetProcessDefinedStep();
         const auto processName = process != nullptr ? process->GetProcessName() : "<null>";
+        // Multiple Coulomb scattering deposits energy along the whole step rather than
+        // at the post-step point, so its deposition position is sampled uniformly on
+        // the segment connecting the pre-step and post-step positions.
+        auto depositionPosition = step->GetPostStepPoint()->GetPosition();
+        if (dynamic_cast<const G4VMultipleScattering*>(process) != nullptr) {
+            const auto preStepPosition = step->GetPreStepPoint()->GetPosition();
+            const auto postStepPosition = step->GetPostStepPoint()->GetPosition();
+            depositionPosition = preStepPosition + G4UniformRand() * (postStepPosition - preStepPosition);
+        }
         mEventAction.AddDepositedEnergy(layerIndex, step->GetTrack()->GetDefinition()->GetParticleName(),
-                                        step->GetPostStepPoint()->GetPosition(), energyDeposit, processName);
+                                        depositionPosition, energyDeposit, processName);
     }
 
 private:
