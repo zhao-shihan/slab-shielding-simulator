@@ -576,7 +576,7 @@ auto WriteHistograms(TFile& outputFile, DepositionHistograms& histograms) -> voi
 // "x_dep_{i}"; non-deposition columns yield no value.
 auto ParseLayerIndex(const std::string& columnName) -> std::optional<int> {
     constexpr auto layerColumnPrefix = std::string_view{"x_dep_"};
-    if (not columnName.starts_with(layerColumnPrefix)) {
+    if (not TString{columnName}.BeginsWith(TString{layerColumnPrefix})) {
         return std::nullopt;
     }
     const auto suffix = std::string_view{columnName}.substr(layerColumnPrefix.size());
